@@ -144,7 +144,7 @@ As features stabilize some brief notes about them will accumulate here.
 #### Fixed
 * SSH: `IdentitiesOnly=yes` now correctly filters agent keys to those matching
   configured `IdentityFile` entries, rather than skipping agent authentication
-  entirely.
+  entirely. Thanks to @GottZ! #7739
 * Race condition when very quickly adjusting font scale, and other improvements
   around resizing. Thanks to @jknockel! #4876 #5032 #5033
 * macOS: wacky initial window size with external monitors or certain font
