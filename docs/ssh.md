@@ -59,6 +59,19 @@ All other options are parsed but have no effect.  Notably, neither `Match` or
 
 `ProxyUseFDpass` is now supported. (But not on Microsoft Windows).
 
+`IdentitiesOnly` is now correctly supported in the ssh2 backend when using agent authentication.
+When `IdentitiesOnly=yes` is set in your ssh config, wezterm will filter the
+keys offered by the SSH agent to only those whose public key matches a
+configured `IdentityFile` entry (checking both the private key file and the
+corresponding `.pub` file).  Previously, `IdentitiesOnly=yes` caused agent
+authentication to be skipped entirely. This also solves using yubikeys, gpg etc.
+
+!!! note
+    wezterm does not derive public keys automatically. If your `IdentityFile`
+    points to a private key without a corresponding `.pub` file alongside it,
+    the key will not be matched against the agent. Generate the public key file
+    with `ssh-keygen -y -f /path/to/key > /path/to/key.pub`.
+
 `ServerAliveInterval` is now supported by the `libssh` backend.  Setting it to
 a non-zero value will cause wezterm to send an `IGNORE` packet on that interval.
 `ServerAliveCountMax` is NOT supported by this backend.  This keepalive
