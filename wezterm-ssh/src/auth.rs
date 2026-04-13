@@ -44,7 +44,7 @@ fn collect_identity_blobs(identity_files: &str) -> Vec<Vec<u8>> {
 fn allowed_agent_key_blobs(config: &crate::config::ConfigMap) -> Option<Vec<Vec<u8>>> {
     if config
         .get("identitiesonly")
-        .map(|s| s == "yes")
+        .map(|s| s.trim().eq_ignore_ascii_case("yes"))
         .unwrap_or(false)
     {
         let blobs = config
@@ -590,6 +590,19 @@ mod tests {
                 .unwrap()
         );
         cleanup(&dir);
+    }
+
+    #[test]
+    fn identities_only_value_is_case_insensitive() {
+        for value in ["YES", "Yes", " yes ", "yEs"] {
+            let mut config = crate::config::ConfigMap::new();
+            config.insert("identitiesonly".into(), value.into());
+            assert!(
+                allowed_agent_key_blobs(&config).is_some(),
+                "value {:?} should enable filtering",
+                value
+            );
+        }
     }
 
     #[test]
