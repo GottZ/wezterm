@@ -64,7 +64,7 @@ When `IdentitiesOnly=yes` is set in your ssh config, wezterm will filter the
 keys offered by the SSH agent to only those whose public key matches a
 configured `IdentityFile` entry (checking both the private key file and the
 corresponding `.pub` file).  Previously, `IdentitiesOnly=yes` caused agent
-authentication to be skipped entirely. This also solves using yubikeys, gpg etc.
+authentication to be skipped entirely. This also solves using YubiKeys, GPG, etc.
 
 !!! note
     wezterm does not derive public keys automatically. If your `IdentityFile`
