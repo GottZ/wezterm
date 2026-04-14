@@ -205,6 +205,10 @@ pub struct CursorTrailState {
     /// False until the first update(); skips spawning on the first frame
     /// to avoid a bogus trail from (0,0) to the real cursor position.
     prev_initialized: bool,
+    /// True when the cursor did not move in the previous frame.
+    /// Used to suppress smear on rapid programmatic cursor movement (e.g. btop
+    /// redraws), which never lets the cursor settle between frames.
+    cursor_was_stable: bool,
 }
 
 impl CursorTrailState {
@@ -219,6 +223,7 @@ impl CursorTrailState {
             count_remainder: 0.0,
             rng: Rng::new(),
             prev_initialized: false,
+            cursor_was_stable: false,
         }
     }
 
@@ -416,7 +421,12 @@ impl CursorTrailState {
             //
             // Only activate for multi-cell jumps (dx+dy > 1) to avoid distracting
             // smear when typing or using single-cell hjkl navigation.
-            if dx + dy > 1 {
+            //
+            // Also require that the cursor was stable (not moving) in the previous
+            // frame. Apps like btop continuously move the cursor across the screen to
+            // redraw their TUI; those rapid programmatic moves never let the cursor
+            // settle, so `cursor_was_stable` stays false and no smear is triggered.
+            if dx + dy > 1 && self.cursor_was_stable {
                 let prev_cx = self.prev_pos.x as f32 * cell_width + cell_width * 0.5;
                 let prev_cy = self.prev_pos.y as f32 * cell_height + cell_height * 0.5;
                 let cur_cx = target_x + cell_width * 0.5;
@@ -482,6 +492,7 @@ impl CursorTrailState {
             }
         }
 
+        self.cursor_was_stable = dx + dy == 0;
         self.prev_pos = *current;
     }
 
