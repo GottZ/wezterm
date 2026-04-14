@@ -1633,4 +1633,277 @@ Config {
 "#
         );
     }
+
+    // ---------------------------------------------------------------
+    // Characterization tests (Wave 1 of ssh_config parser refactor)
+    //
+    // Each test carries the OpenSSH ground truth (`ssh -G`) in a
+    // comment. The snapshot records what wezterm-ssh actually does
+    // today. Divergences are intentional — they pin the current
+    // (partially buggy) behaviour as a baseline so later refactor
+    // waves can show the exact diff.
+    // ---------------------------------------------------------------
+
+    fn characterize_parse(config_str: &str) -> ConfigMap {
+        let mut config = Config::new();
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        config.assign_environment(fake_env);
+        config.add_config_string(config_str);
+        config.for_host("foo")
+    }
+
+    fn characterize_identity(config_str: &str) -> Option<String> {
+        characterize_parse(config_str).get("identityfile").cloned()
+    }
+
+    #[test]
+    fn characterize_identity_file_simple() {
+        // OpenSSH `ssh -G`:
+        //   identityfile /home/me/.ssh/id_rsa
+        let ident = characterize_identity(
+            r#"
+            Host foo
+                IdentityFile /home/me/.ssh/id_rsa
+            "#,
+        );
+        snapshot!(
+            ident,
+            r#"
+Some(
+    "/home/me/.ssh/id_rsa",
+)
+"#
+        );
+    }
+
+    #[test]
+    fn characterize_identity_file_quoted_space() {
+        // OpenSSH `ssh -G`:
+        //   identityfile /home/me/.ssh/path with space/id_rsa
+        // (outer quotes stripped, inner space preserved)
+        let ident = characterize_identity(
+            r#"
+            Host foo
+                IdentityFile "/home/me/.ssh/path with space/id_rsa"
+            "#,
+        );
+        snapshot!(
+            ident,
+            r#"
+Some(
+    "/home/me/.ssh/path with space/id_rsa",
+)
+"#
+        );
+    }
+
+    #[test]
+    fn characterize_identity_file_escaped_space() {
+        // OpenSSH `ssh -G`:
+        //   identityfile /home/me/.ssh/path with space/id_rsa
+        // (backslash-escapes consumed, inner space preserved)
+        let ident = characterize_identity(
+            r#"
+            Host foo
+                IdentityFile /home/me/.ssh/path\ with\ space/id_rsa
+            "#,
+        );
+        snapshot!(
+            ident,
+            r#"
+Some(
+    "/home/me/.ssh/path\\ with\\ space/id_rsa",
+)
+"#
+        );
+    }
+
+    #[test]
+    fn characterize_identity_file_single_quotes() {
+        // OpenSSH `ssh -G`:
+        //   identityfile /home/me/.ssh/single quoted
+        // (single quotes are treated identically to double quotes)
+        let ident = characterize_identity(
+            r#"
+            Host foo
+                IdentityFile '/home/me/.ssh/single quoted'
+            "#,
+        );
+        snapshot!(
+            ident,
+            r#"
+Some(
+    "'/home/me/.ssh/single quoted'",
+)
+"#
+        );
+    }
+
+    #[test]
+    fn characterize_identity_file_two_tokens_one_line() {
+        // OpenSSH `ssh -G` HARD ERROR:
+        //   "keyword identityfile extra arguments at end of line"
+        //   terminating, 1 bad configuration options (exit 255)
+        // wezterm-ssh currently accepts and stores both tokens; after
+        // the refactor this should become a parser error.
+        let ident = characterize_identity(
+            r#"
+            Host foo
+                IdentityFile /home/me/.ssh/first /home/me/.ssh/second
+            "#,
+        );
+        snapshot!(
+            ident,
+            r#"
+Some(
+    "/home/me/.ssh/first /home/me/.ssh/second",
+)
+"#
+        );
+    }
+
+    #[test]
+    fn characterize_identity_file_multi_line() {
+        // OpenSSH `ssh -G`:
+        //   identityfile /home/me/.ssh/first
+        //   identityfile /home/me/.ssh/second
+        //   identityfile /home/me/.ssh/third
+        // (three additive, order preserved)
+        let ident = characterize_identity(
+            r#"
+            Host foo
+                IdentityFile /home/me/.ssh/first
+                IdentityFile /home/me/.ssh/second
+                IdentityFile /home/me/.ssh/third
+            "#,
+        );
+        snapshot!(
+            ident,
+            r#"
+Some(
+    "/home/me/.ssh/first /home/me/.ssh/second /home/me/.ssh/third",
+)
+"#
+        );
+    }
+
+    #[test]
+    fn characterize_identity_file_multi_mixed_quotes() {
+        // OpenSSH `ssh -G`:
+        //   identityfile /home/me/.ssh/first one
+        //   identityfile /home/me/.ssh/second
+        //   identityfile /home/me/.ssh/third path
+        // (three distinct paths, some with inner spaces, all intact)
+        let ident = characterize_identity(
+            r#"
+            Host foo
+                IdentityFile "/home/me/.ssh/first one"
+                IdentityFile /home/me/.ssh/second
+                IdentityFile /home/me/.ssh/third\ path
+            "#,
+        );
+        snapshot!(
+            ident,
+            r#"
+Some(
+    "/home/me/.ssh/first one /home/me/.ssh/second /home/me/.ssh/third\\ path",
+)
+"#
+        );
+    }
+
+    #[test]
+    fn characterize_identity_file_none_literal() {
+        // OpenSSH `ssh -G`:
+        //   identityfile /home/me/.ssh/first
+        //   identityfile none
+        //   identityfile /home/me/.ssh/second
+        // (`none` is a literal entry at the ssh_config layer; the
+        // special semantics fire later in load_public_identity_files
+        // in ssh.c:2400 – not the parser's concern)
+        let ident = characterize_identity(
+            r#"
+            Host foo
+                IdentityFile /home/me/.ssh/first
+                IdentityFile none
+                IdentityFile /home/me/.ssh/second
+            "#,
+        );
+        snapshot!(
+            ident,
+            r#"
+Some(
+    "/home/me/.ssh/first none /home/me/.ssh/second",
+)
+"#
+        );
+    }
+
+    #[test]
+    fn characterize_identity_file_unbalanced_quote() {
+        // OpenSSH `ssh -G` HARD ERROR:
+        //   terminating, 1 bad configuration options
+        // wezterm-ssh currently accepts the input silently and keeps
+        // the literal `"` character in the stored value.
+        let ident = characterize_identity(
+            r#"
+            Host foo
+                IdentityFile "/home/me/.ssh/unclosed
+            "#,
+        );
+        snapshot!(
+            ident,
+            r#"
+Some(
+    ""/home/me/.ssh/unclosed",
+)
+"#
+        );
+    }
+
+    #[test]
+    fn characterize_identity_file_trailing_comment() {
+        // OpenSSH `ssh -G`:
+        //   identityfile /home/me/.ssh/id_rsa
+        // (trailing `#` comment stripped by the tokenizer)
+        let ident = characterize_identity(
+            r#"
+            Host foo
+                IdentityFile /home/me/.ssh/id_rsa # trailing comment
+            "#,
+        );
+        snapshot!(
+            ident,
+            r#"
+Some(
+    "/home/me/.ssh/id_rsa # trailing comment",
+)
+"#
+        );
+    }
+
+    #[test]
+    fn characterize_identities_only_mixed_case_value() {
+        // OpenSSH `ssh -G` normalises the value to lowercase:
+        //   identitiesonly yes
+        // wezterm-ssh preserves the original casing at parse time and
+        // relies on case-insensitive compare at the consumer site.
+        let opts = characterize_parse(
+            r#"
+            Host foo
+                IdentitiesOnly YES
+                IdentityFile /home/me/.ssh/id_rsa
+            "#,
+        );
+        snapshot!(
+            opts.get("identitiesonly").cloned(),
+            r#"
+Some(
+    "YES",
+)
+"#
+        );
+    }
 }
