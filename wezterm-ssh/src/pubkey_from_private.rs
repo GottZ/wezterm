@@ -51,22 +51,40 @@ pub enum DerivePubkeyError {
 /// error (matching how `collect_identity_blobs` already handles
 /// missing `.pub` files today).
 pub fn derive_public_blob(path: &Path) -> Result<Option<Vec<u8>>, DerivePubkeyError> {
+    // Read `path` once so strategies 1 and 3 can share the same
+    // bytes. Strategies are tried in OpenSSH's `sshkey_load_public`
+    // order: path-as-pub, then sibling `.pub`, then private envelope.
+    let path_bytes = std::fs::read(path).ok();
+
     // Strategy 1: `path` itself is a `.pub`-style public key file
     // (the user pointed `IdentityFile` directly at one).
-    if let Ok(bytes) = std::fs::read(path) {
-        if let Some(blob) = parse_openssh_public_line(&bytes) {
+    if let Some(bytes) = path_bytes.as_deref() {
+        if let Some(blob) = parse_openssh_public_line(bytes) {
             log::trace!(
                 "pubkey for {:?}: strategy 1 (path is itself a .pub file)",
                 path.display()
             );
             return Ok(Some(blob));
         }
+    }
 
-        // Strategy 3: the file exists but was not a public key —
-        // try the OpenSSH private key envelope. `ssh_key` returns
-        // a `PrivateKey` whose `public_key()` is populated from the
-        // unencrypted prefix regardless of whether `key_data` is
-        // encrypted.
+    // Strategy 2: `<path>.pub` sibling on disk — the fast happy path
+    // when ssh-keygen wrote the public half alongside the private
+    // half.
+    if let Some((blob, pub_path)) = try_sibling_pub(path) {
+        log::trace!(
+            "pubkey for {:?}: strategy 2 (sibling {:?})",
+            path.display(),
+            pub_path.display()
+        );
+        return Ok(Some(blob));
+    }
+
+    // Strategy 3: parse `path` as an OpenSSH private key envelope
+    // and return its public half from the unencrypted prefix. Works
+    // even for passphrase-protected keys, because the public blob
+    // lives in the envelope header before the encrypted key data.
+    if let Some(bytes) = path_bytes {
         let path_str = path.to_string_lossy().into_owned();
         match ssh_key::PrivateKey::from_openssh(bytes.as_slice()) {
             Ok(private) => {
@@ -84,20 +102,8 @@ pub fn derive_public_blob(path: &Path) -> Result<Option<Vec<u8>>, DerivePubkeyEr
                 return Ok(Some(blob));
             }
             Err(parse_err) => {
-                // Fall through to Strategy 2 (`.pub` sibling). If
-                // that also misses we surface the private-envelope
-                // parse error since the user explicitly asked for
-                // this file.
-                if let Some((blob, pub_path)) = try_sibling_pub(path) {
-                    log::trace!(
-                        "pubkey for {:?}: strategy 2 (sibling {:?})",
-                        path.display(),
-                        pub_path.display()
-                    );
-                    return Ok(Some(blob));
-                }
                 log::debug!(
-                    "pubkey for {:?}: strategies 1 and 3 failed, sibling .pub missing; surfacing parse error",
+                    "pubkey for {:?}: all three strategies failed; surfacing parse error",
                     path.display()
                 );
                 return Err(DerivePubkeyError::Parse {
@@ -108,16 +114,7 @@ pub fn derive_public_blob(path: &Path) -> Result<Option<Vec<u8>>, DerivePubkeyEr
         }
     }
 
-    // `path` is not readable. Maybe the sibling `.pub` is still
-    // around on its own (unusual but not impossible).
-    if let Some((blob, pub_path)) = try_sibling_pub(path) {
-        log::trace!(
-            "pubkey for {:?}: strategy 2 only (private missing, sibling {:?})",
-            path.display(),
-            pub_path.display()
-        );
-        return Ok(Some(blob));
-    }
+    // `path` is not readable and sibling `.pub` is missing too.
     log::debug!(
         "pubkey for {:?}: no public or private key material found",
         path.display()

@@ -215,11 +215,12 @@ pub fn ssh_domain_to_host_options(ssh_dom: &SshDomain) -> anyhow::Result<HostOpt
         // IdentityFile overrides coming in via `-o` on the command
         // line are accumulated into the typed list so that repeated
         // `-o IdentityFile=...` flags stack (wave 6 fix for the CLI
-        // clobber bug in wezterm-gui/src/main.rs).
+        // clobber bug in wezterm-gui/src/main.rs). `push_identity_file`
+        // keeps the legacy `ConfigMap` view in sync so that any
+        // downstream code still reading the flat map observes the
+        // override as well.
         if k.eq_ignore_ascii_case("identityfile") {
-            host_options
-                .identity_files
-                .push(wezterm_ssh::IdentityFileEntry { path: v.clone() });
+            host_options.push_identity_file(v.clone());
             continue;
         }
         host_options.options.insert(k.to_string(), v.to_string());

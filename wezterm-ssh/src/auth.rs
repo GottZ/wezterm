@@ -142,6 +142,20 @@ impl crate::sessioninner::SessionInner {
         // while `tx_event.try_send` below wants &mut self access.
         let identity_files = self.identity_files.clone();
         for entry in &identity_files {
+            // If the user pointed IdentityFile directly at a `.pub`
+            // file we cannot sign with it, and `userauth_pubkey_file`
+            // would otherwise probe a bogus `<path>.pub.pub` sibling
+            // and likely prompt for a spurious passphrase. The
+            // agent-key blob matching in `agent_auth` already handles
+            // the `.pub` case correctly via `derive_public_blob`.
+            if entry.path.ends_with(".pub") {
+                log::trace!(
+                    "pubkey_auth: skipping public-only identity entry {}",
+                    entry.path
+                );
+                continue;
+            }
+
             let pubkey: PathBuf = format!("{}.pub", entry.path).into();
             let file = Path::new(&entry.path);
 
@@ -544,6 +558,27 @@ mod tests {
         .unwrap();
         let priv_path = dir.join("id_test");
         let entries = entries_from(&[priv_path.to_str().unwrap()]);
+        let blobs = collect_identity_blobs(&entries);
+        assert_eq!(blobs.len(), 1);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn collect_blobs_accepts_identity_file_pointing_at_dotpub_directly() {
+        // `IdentityFile` can legally point directly at a `.pub` file
+        // (e.g. when the user only wants agent-auth for that key and
+        // the private half lives elsewhere or on a hardware token).
+        // The typed list must still yield the blob for the agent
+        // filter, even though `pubkey_auth` will skip the entry as
+        // unsignable (see the `.pub` ending check in `pubkey_auth`).
+        let dir = tmpdir("blobs_direct_pub");
+        let pub_path = dir.join("id_test.pub");
+        std::fs::write(
+            &pub_path,
+            "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAA pubdirect\n",
+        )
+        .unwrap();
+        let entries = entries_from(&[pub_path.to_str().unwrap()]);
         let blobs = collect_identity_blobs(&entries);
         assert_eq!(blobs.len(), 1);
         cleanup(&dir);

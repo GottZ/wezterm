@@ -155,6 +155,35 @@ pub struct HostOptions {
     pub identity_files: Vec<IdentityFileEntry>,
 }
 
+impl HostOptions {
+    /// Append a new `IdentityFile` entry while keeping the typed
+    /// list and the legacy space-concatenated `ConfigMap` entry in
+    /// sync.
+    ///
+    /// Prefer this helper over touching `identity_files` and
+    /// `options["identityfile"]` directly in mutation sites such as
+    /// the `-o IdentityFile=...` CLI override handler. The typed
+    /// list is the source of truth for paths containing whitespace;
+    /// the flat map view follows the legacy convention of
+    /// space-joined values so that downstream code reading the
+    /// `ConfigMap` still sees the entry (albeit lossy for any path
+    /// containing a literal space).
+    pub fn push_identity_file(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        self.identity_files
+            .push(IdentityFileEntry { path: path.clone() });
+        self.options
+            .entry("identityfile".to_string())
+            .and_modify(|existing| {
+                if !existing.is_empty() {
+                    existing.push(' ');
+                }
+                existing.push_str(&path);
+            })
+            .or_insert(path);
+    }
+}
+
 impl From<ConfigMap> for HostOptions {
     /// Build a [`HostOptions`] from a legacy flat `ConfigMap`.
     ///
@@ -2328,5 +2357,47 @@ Some(
             "#,
         );
         assert_eq!(paths, vec!["/home/me/.ssh/foo_only".to_string()]);
+    }
+
+    #[test]
+    fn host_options_push_identity_file_keeps_typed_list_and_flat_map_in_sync() {
+        // Regression guard for the `-o IdentityFile=...` CLI override
+        // path: the typed list and the legacy `ConfigMap` entry must
+        // not drift.
+        let mut host_options = HostOptions::default();
+        host_options.push_identity_file("/home/me/.ssh/first");
+        host_options.push_identity_file("/home/me/.ssh/second");
+
+        assert_eq!(host_options.identity_files.len(), 2);
+        assert_eq!(host_options.identity_files[0].path, "/home/me/.ssh/first");
+        assert_eq!(host_options.identity_files[1].path, "/home/me/.ssh/second");
+
+        // The flat `ConfigMap` entry follows the legacy space-joined
+        // convention so downstream code reading it observes both
+        // overrides.
+        assert_eq!(
+            host_options.options.get("identityfile").cloned(),
+            Some("/home/me/.ssh/first /home/me/.ssh/second".to_string())
+        );
+    }
+
+    #[test]
+    fn host_options_push_identity_file_appends_onto_existing_legacy_value() {
+        // If the flat map already carries an `identityfile` (e.g.
+        // because `Config::resolve_host` populated it from the
+        // parsed ssh_config), pushing an override must extend it
+        // rather than replace it.
+        let mut host_options = HostOptions::default();
+        host_options
+            .options
+            .insert("identityfile".to_string(), "/existing".to_string());
+        host_options.push_identity_file("/new");
+
+        assert_eq!(
+            host_options.options.get("identityfile").cloned(),
+            Some("/existing /new".to_string())
+        );
+        assert_eq!(host_options.identity_files.len(), 1);
+        assert_eq!(host_options.identity_files[0].path, "/new");
     }
 }
