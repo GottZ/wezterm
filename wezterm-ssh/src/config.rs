@@ -725,7 +725,12 @@ impl Config {
     }
 
     /// Resolve the `IdentityFile` entries that apply to `host`, in
-    /// the order OpenSSH would try them.
+    /// the order OpenSSH would try them, with tilde, percent-token
+    /// and `${VAR}` expansion applied per entry so that each
+    /// returned path is ready to hand to `std::fs::read`.
+    ///
+    /// Thin wrapper around [`Config::resolve_host`]; prefer
+    /// `resolve_host` when you also need the flat `ConfigMap` view.
     ///
     /// The ordering mirrors upstream `ssh_config(5)` semantics:
     ///
@@ -735,12 +740,6 @@ impl Config {
     ///    matches `host`, in the order the stanzas appear on disk,
     ///    and for each stanza in declaration order.
     ///
-    /// Paths are returned exactly as emitted by the `argv_split`
-    /// tokeniser (quotes and backslash escapes already consumed) but
-    /// **before** tilde / percent / environment expansion — the
-    /// caller is responsible for expanding them when it actually
-    /// wants to open the file.
-    ///
     /// If no `IdentityFile` directive matched anywhere, the built-in
     /// OpenSSH defaults are substituted: `~/.ssh/id_dsa`,
     /// `~/.ssh/id_ecdsa`, `~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, in
@@ -748,7 +747,15 @@ impl Config {
     /// `readconf.c::fill_default_options`: defaults are only added
     /// when the user did not supply any `IdentityFile` of their own.
     pub fn resolve_identity_files<H: AsRef<str>>(&self, host: H) -> Vec<IdentityFileEntry> {
-        let host = host.as_ref();
+        self.resolve_host(host).identity_files
+    }
+
+    /// Collect the raw, **unexpanded** identity file entries that
+    /// apply to `host`. Used internally by [`Config::resolve_host`]
+    /// before per-entry token / environment expansion. See
+    /// [`Config::resolve_identity_files`] for the public entry
+    /// point with expansion applied.
+    fn collect_raw_identity_files(&self, host: &str) -> Vec<IdentityFileEntry> {
         let local_user = self.resolve_local_user();
         let target_user = &local_user;
         let mut entries: Vec<IdentityFileEntry> = Vec::new();
@@ -774,15 +781,107 @@ impl Config {
         entries
     }
 
+    /// Build the `%`-token map in exactly the same shape that
+    /// [`Config::for_host`] uses for flat-map expansion, so that
+    /// the typed `IdentityFile` list expands with the same
+    /// `%h`/`%p`/`%r`/`%n` values.
+    fn build_token_map_for_host(&self, host: &str, resolved: &ConfigMap) -> ConfigMap {
+        let target_user = self.resolve_local_user();
+        let mut token_map = self.tokens.clone();
+        let hostname = resolved
+            .get("hostname")
+            .cloned()
+            .unwrap_or_else(|| host.to_string());
+        let port = resolved
+            .get("port")
+            .cloned()
+            .unwrap_or_else(|| "22".to_string());
+        token_map.insert("%h".to_string(), hostname);
+        token_map.insert("%n".to_string(), host.to_string());
+        token_map.insert("%r".to_string(), target_user);
+        token_map.insert("%p".to_string(), port);
+        token_map
+    }
+
+    /// Expand tilde, `%`-tokens and `${VAR}` references in a single
+    /// path string, **without** whitespace-splitting the value.
+    /// This is the per-entry equivalent of `expand_tokens` +
+    /// `expand_environment` as used by [`Config::for_host`] on the
+    /// flat map, but safe for identity paths that legitimately
+    /// contain spaces.
+    fn expand_identity_path(&self, path: &mut String, token_map: &ConfigMap) {
+        // Tilde shortcut at the very start of the path.
+        if path.starts_with("~/") {
+            if let Some(home) = self.resolve_home() {
+                path.replace_range(0..1, &home);
+            }
+        }
+
+        // Percent-token substitution on the whole string.
+        let tokens: [&str; 10] = ["%C", "%d", "%h", "%i", "%L", "%l", "%n", "%p", "%r", "%u"];
+        for &t in &tokens {
+            if !path.contains(t) {
+                continue;
+            }
+            let replacement: Option<String> = if let Some(v) = token_map.get(t) {
+                Some(v.clone())
+            } else if t == "%i" {
+                Some(self.resolve_uid())
+            } else if t == "%u" {
+                Some(self.resolve_local_user())
+            } else if t == "%l" {
+                Some(self.resolve_local_host(false))
+            } else if t == "%L" {
+                Some(self.resolve_local_host(true))
+            } else if t == "%d" {
+                self.resolve_home()
+            } else if t == "%C" {
+                // Hash of %l%h%p%r%j, recursively expanded against
+                // the same token_map. Uses the existing
+                // `expand_tokens` because the intermediate value is
+                // a synthesised non-path string, not a user-visible
+                // path.
+                use sha2::Digest;
+                let mut c_value = "%l%h%p%r%j".to_string();
+                self.expand_tokens(&mut c_value, &["%l", "%h", "%p", "%r", "%j"], token_map);
+                Some(hex::encode(sha2::Sha256::digest(c_value.as_bytes())))
+            } else {
+                None
+            };
+            if let Some(v) = replacement {
+                *path = path.replace(t, &v);
+            }
+        }
+
+        // `%%` escape → literal `%`.
+        *path = path.replace("%%", "%");
+
+        // `${VAR}` environment substitution.
+        self.expand_environment(path);
+    }
+
     /// Resolve both the flat ConfigMap and the typed IdentityFile
     /// list for the given host in a single call. This is the
     /// recommended entry point for [`crate::Session::connect`] so
     /// that consumers see a consistent view of both representations.
+    ///
+    /// `IdentityFile` paths are expanded per entry (tilde, `%`
+    /// tokens, `${VAR}`) using the same resolution rules as the
+    /// flat map, but without the whitespace-splitting step that the
+    /// flat map applies — paths containing spaces survive intact.
     pub fn resolve_host<H: AsRef<str>>(&self, host: H) -> HostOptions {
         let host = host.as_ref();
+        let options = self.for_host(host);
+        let token_map = self.build_token_map_for_host(host, &options);
+
+        let mut identity_files = self.collect_raw_identity_files(host);
+        for entry in &mut identity_files {
+            self.expand_identity_path(&mut entry.path, &token_map);
+        }
+
         HostOptions {
-            options: self.for_host(host),
-            identity_files: self.resolve_identity_files(host),
+            options,
+            identity_files,
         }
     }
 
@@ -2379,6 +2478,66 @@ Some(
             host_options.options.get("identityfile").cloned(),
             Some("/home/me/.ssh/first /home/me/.ssh/second".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_identity_files_expands_tilde_in_path() {
+        // `~/.ssh/id_rsa` must become `/home/me/.ssh/id_rsa` so
+        // that `std::fs::read` can open it directly — unexpanded
+        // paths would silently fail the agent filter and pubkey
+        // auth.
+        let paths = resolve_identity_file_paths(
+            r#"
+            Host foo
+                IdentityFile ~/.ssh/id_rsa
+            "#,
+        );
+        assert_eq!(paths, vec!["/home/me/.ssh/id_rsa".to_string()]);
+    }
+
+    #[test]
+    fn resolve_identity_files_expands_percent_d_to_home() {
+        // `%d` is OpenSSH's alias for the current user's home
+        // directory. It must expand per entry without
+        // whitespace-splitting the path.
+        let paths = resolve_identity_file_paths(
+            r#"
+            Host foo
+                IdentityFile %d/.ssh/id_rsa
+            "#,
+        );
+        assert_eq!(paths, vec!["/home/me/.ssh/id_rsa".to_string()]);
+    }
+
+    #[test]
+    fn resolve_identity_files_expands_percent_h_and_percent_r() {
+        // `%h` expands to the resolved hostname, `%r` to the target
+        // user. Both must be populated from the same token_map
+        // that `for_host` uses so the flat map and the typed list
+        // agree.
+        let paths = resolve_identity_file_paths(
+            r#"
+            Host foo
+                User someone
+                IdentityFile /home/me/.ssh/%r@%h
+            "#,
+        );
+        assert_eq!(paths, vec!["/home/me/.ssh/me@foo".to_string()]);
+    }
+
+    #[test]
+    fn resolve_identity_files_expansion_preserves_space_in_quoted_path() {
+        // Regression guard: a quoted path containing both a space
+        // and a `%d` token must expand `%d` without ever
+        // whitespace-splitting, which would otherwise tear
+        // `path with space/id_rsa` into three fragments.
+        let paths = resolve_identity_file_paths(
+            r#"
+            Host foo
+                IdentityFile "%d/path with space/id_rsa"
+            "#,
+        );
+        assert_eq!(paths, vec!["/home/me/path with space/id_rsa".to_string()]);
     }
 
     #[test]

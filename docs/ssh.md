@@ -84,9 +84,11 @@ rules:
   `\ ` (backslash followed by a space) works only outside quotes. For
   example `IdentityFile /home/me/.ssh/path\ with\ space/id_rsa`
   resolves to the same path as the quoted form above.
-* An unquoted `#` terminates the line as a comment. A `#` inside
-  quotes is taken literally, so paths containing `#` need to be
-  quoted.
+* An unquoted `#` at the **start** of a token terminates the rest of
+  the line as a comment, matching OpenSSH's `argv_split` upstream.
+  A `#` that appears inside quotes, inside a `${VAR}` reference, or
+  in the middle of an unquoted token is preserved literally — paths
+  containing `#` in their middle do not need to be quoted.
 * Unbalanced quotes are a hard error; the offending line is skipped
   with a warning in the log rather than silently stored as part of the
   value.

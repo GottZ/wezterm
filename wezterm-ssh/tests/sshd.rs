@@ -478,18 +478,20 @@ pub async fn session(#[default(Config::new())] config: Config, sshd: Sshd) -> Se
                   ecdsa-sha2-nistp384,ecdsa-sha2-nistp256"
             .to_string(),
     );
+    // Reset both the typed list and the legacy flat-map entry
+    // before installing the test identity, then use the helper so
+    // that both views stay in sync (any drift here would defeat
+    // the regression guard it exists to provide).
     host_options.identity_files.clear();
-    host_options
-        .identity_files
-        .push(wezterm_ssh::IdentityFileEntry {
-            path: sshd
-                .tmp
-                .child("id_rsa")
-                .path()
-                .to_str()
-                .expect("Failed to get string path for id_rsa")
-                .to_string(),
-        });
+    host_options.options.remove("identityfile");
+    host_options.push_identity_file(
+        sshd.tmp
+            .child("id_rsa")
+            .path()
+            .to_str()
+            .expect("Failed to get string path for id_rsa")
+            .to_string(),
+    );
     host_options.options.insert(
         "userknownhostsfile".to_string(),
         sshd.tmp
