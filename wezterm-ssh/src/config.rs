@@ -88,6 +88,36 @@ enum Context {
     Final,
 }
 
+/// A single `IdentityFile` directive value after parsing.
+///
+/// The `path` field holds the literal path string as OpenSSH's
+/// `argv_split` would emit it: outer quotes stripped, backslash
+/// escapes (`\\`, `\"`, `\'` and `\ `) consumed, but
+/// `~` / `%h` / `$VAR` style expansion is *not* performed — that
+/// happens later in the resolver when the concrete host identity
+/// is known. Consumers should treat `path` as an opaque file path
+/// suitable for `std::fs::read` once expansion has occurred.
+///
+/// A list of these entries is kept alongside the legacy
+/// space-concatenated `ConfigMap` value by [`Config`]. Everything
+/// that needs a faithful view of the declared identities (agent-key
+/// filtering under `IdentitiesOnly=yes`, pubkey auth, libssh's
+/// `AddIdentity`) should read the list, not the legacy string,
+/// because only the typed form survives paths containing whitespace
+/// and preserves declaration order across `Host` and `Match`
+/// stanzas.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityFileEntry {
+    /// The literal path as declared in the configuration.
+    pub path: String,
+}
+
+impl IdentityFileEntry {
+    fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
 /// Represents `Host pattern,list` stanza in the config,
 /// and the options that it logically contains
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -95,6 +125,10 @@ struct MatchGroup {
     criteria: Vec<Criteria>,
     context: Context,
     options: ConfigMap,
+    /// `IdentityFile` entries declared inside this stanza, in the
+    /// order they were parsed. Kept separately from `options` so that
+    /// paths containing whitespace survive the round-trip.
+    identity_files: Vec<IdentityFileEntry>,
 }
 
 impl MatchGroup {
@@ -147,6 +181,9 @@ struct ParsedConfigFile {
     groups: Vec<MatchGroup>,
     /// list of loaded file names
     loaded_files: Vec<PathBuf>,
+    /// `IdentityFile` entries declared before any `Host` stanza, in
+    /// declaration order.
+    identity_files: Vec<IdentityFileEntry>,
 }
 
 impl ParsedConfigFile {
@@ -154,17 +191,26 @@ impl ParsedConfigFile {
         let mut options = ConfigMap::new();
         let mut groups = vec![];
         let mut loaded_files = vec![];
+        let mut identity_files = vec![];
 
         if let Some(source) = source_file {
             loaded_files.push(source.to_path_buf());
         }
 
-        Self::parse_impl(s, cwd, &mut options, &mut groups, &mut loaded_files);
+        Self::parse_impl(
+            s,
+            cwd,
+            &mut options,
+            &mut groups,
+            &mut loaded_files,
+            &mut identity_files,
+        );
 
         Self {
             options,
             groups,
             loaded_files,
+            identity_files,
         }
     }
 
@@ -174,6 +220,7 @@ impl ParsedConfigFile {
         options: &mut ConfigMap,
         groups: &mut Vec<MatchGroup>,
         loaded_files: &mut Vec<PathBuf>,
+        identity_files: &mut Vec<IdentityFileEntry>,
     ) {
         match filenamegen::Glob::new(&pattern) {
             Ok(g) => {
@@ -198,6 +245,7 @@ impl ParsedConfigFile {
                                         options,
                                         groups,
                                         loaded_files,
+                                        identity_files,
                                     );
                                 }
                                 Err(err) => {
@@ -231,6 +279,7 @@ impl ParsedConfigFile {
         options: &mut ConfigMap,
         groups: &mut Vec<MatchGroup>,
         loaded_files: &mut Vec<PathBuf>,
+        identity_files: &mut Vec<IdentityFileEntry>,
     ) {
         for line in s.lines() {
             let line = line.trim();
@@ -285,7 +334,7 @@ impl ParsedConfigFile {
 
             if key == "include" {
                 for token in &tokens {
-                    Self::do_include(token, cwd, options, groups, loaded_files);
+                    Self::do_include(token, cwd, options, groups, loaded_files, identity_files);
                 }
                 continue;
             }
@@ -295,6 +344,7 @@ impl ParsedConfigFile {
                     criteria: vec![Criteria::Host(patterns_from_tokens(&tokens))],
                     options: ConfigMap::new(),
                     context: Context::FirstPass,
+                    identity_files: Vec::new(),
                 });
                 continue;
             }
@@ -348,6 +398,7 @@ impl ParsedConfigFile {
                     criteria,
                     options: ConfigMap::new(),
                     context,
+                    identity_files: Vec::new(),
                 });
                 continue;
             }
@@ -394,6 +445,19 @@ impl ParsedConfigFile {
                     .or_insert_with(|| v.to_string());
             }
 
+            // IdentityFile needs a parallel typed list so that paths
+            // containing whitespace survive. The legacy ConfigMap
+            // entry is still populated so that consumers that have
+            // not yet migrated keep working (wave 5 flips them over).
+            if key == "identityfile" {
+                let entry = IdentityFileEntry::new(value.clone());
+                if let Some(group) = groups.last_mut() {
+                    group.identity_files.push(entry);
+                } else {
+                    identity_files.push(entry);
+                }
+            }
+
             if let Some(group) = groups.last_mut() {
                 add_option(&mut group.options, key, &value);
             } else {
@@ -430,6 +494,32 @@ impl ParsedConfigFile {
         }
 
         needs_reparse
+    }
+
+    /// Append IdentityFile entries that apply to the given host onto
+    /// `target`, in declaration order: file-global entries first,
+    /// then entries from every matching stanza in the order the
+    /// stanzas appeared in the file. This mirrors OpenSSH's
+    /// additive semantics ("multiple IdentityFile directives add to
+    /// the list of identities tried").
+    fn collect_identity_files(
+        &self,
+        hostname: &str,
+        user: &str,
+        local_user: &str,
+        context: Context,
+        target: &mut Vec<IdentityFileEntry>,
+    ) {
+        for entry in &self.identity_files {
+            target.push(entry.clone());
+        }
+        for group in &self.groups {
+            if group.is_match(hostname, user, local_user, context) {
+                for entry in &group.identity_files {
+                    target.push(entry.clone());
+                }
+            }
+        }
     }
 }
 
@@ -536,6 +626,56 @@ impl Config {
             }
         }
         "unknown-user".to_string()
+    }
+
+    /// Resolve the `IdentityFile` entries that apply to `host`, in
+    /// the order OpenSSH would try them.
+    ///
+    /// The ordering mirrors upstream `ssh_config(5)` semantics:
+    ///
+    /// 1. Entries declared outside any `Host`/`Match` stanza (file
+    ///    global), in declaration order.
+    /// 2. Entries from each `Host`/`Match` stanza whose pattern
+    ///    matches `host`, in the order the stanzas appear on disk,
+    ///    and for each stanza in declaration order.
+    ///
+    /// Paths are returned exactly as emitted by the `argv_split`
+    /// tokeniser (quotes and backslash escapes already consumed) but
+    /// **before** tilde / percent / environment expansion — the
+    /// caller is responsible for expanding them when it actually
+    /// wants to open the file.
+    ///
+    /// If no `IdentityFile` directive matched anywhere, the built-in
+    /// OpenSSH defaults are substituted: `~/.ssh/id_dsa`,
+    /// `~/.ssh/id_ecdsa`, `~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, in
+    /// that order. This matches OpenSSH's behaviour in
+    /// `readconf.c::fill_default_options`: defaults are only added
+    /// when the user did not supply any `IdentityFile` of their own.
+    pub fn resolve_identity_files<H: AsRef<str>>(&self, host: H) -> Vec<IdentityFileEntry> {
+        let host = host.as_ref();
+        let local_user = self.resolve_local_user();
+        let target_user = &local_user;
+        let mut entries: Vec<IdentityFileEntry> = Vec::new();
+
+        for config in &self.config_files {
+            config.collect_identity_files(
+                host,
+                target_user,
+                &local_user,
+                Context::FirstPass,
+                &mut entries,
+            );
+        }
+
+        if entries.is_empty() {
+            if let Some(home) = self.resolve_home() {
+                for name in ["id_dsa", "id_ecdsa", "id_ed25519", "id_rsa"] {
+                    entries.push(IdentityFileEntry::new(format!("{}/.ssh/{}", home, name)));
+                }
+            }
+        }
+
+        entries
     }
 
     /// Resolve the configuration for a given host.
@@ -934,9 +1074,11 @@ Config {
                     options: {
                         "proxycommand": "/usr/bin/ssh-proxy-helper -oX=Y host 22",
                     },
+                    identity_files: [],
                 },
             ],
             loaded_files: [],
+            identity_files: [],
         },
     ],
     options: {},
@@ -1025,9 +1167,15 @@ Config {
                         "identityfile": "%d/.ssh/id_pub.dsa",
                         "user": "foo",
                     },
+                    identity_files: [
+                        IdentityFileEntry {
+                            path: "%d/.ssh/id_pub.dsa",
+                        },
+                    ],
                 },
             ],
             loaded_files: [],
+            identity_files: [],
         },
     ],
     options: {},
@@ -1282,6 +1430,11 @@ Config {
                         "fowardagent": "yes",
                         "identityfile": "%d/.ssh/id_pub.dsa",
                     },
+                    identity_files: [
+                        IdentityFileEntry {
+                            path: "%d/.ssh/id_pub.dsa",
+                        },
+                    ],
                 },
                 MatchGroup {
                     criteria: [
@@ -1317,6 +1470,7 @@ Config {
                         "forwardagent": "no",
                         "identityagent": "${HOME}/.ssh/agent",
                     },
+                    identity_files: [],
                 },
                 MatchGroup {
                     criteria: [
@@ -1352,6 +1506,7 @@ Config {
                         "forwardagent": "no",
                         "identityagent": "${HOME}/.ssh/agent-me",
                     },
+                    identity_files: [],
                 },
                 MatchGroup {
                     criteria: [
@@ -1370,9 +1525,11 @@ Config {
                     options: {
                         "something": "else",
                     },
+                    identity_files: [],
                 },
             ],
             loaded_files: [],
+            identity_files: [],
         },
     ],
     options: {},
@@ -1545,6 +1702,11 @@ Config {
                         "fowardagent": "yes",
                         "identityfile": "%d/.ssh/id_pub.dsa",
                     },
+                    identity_files: [
+                        IdentityFileEntry {
+                            path: "%d/.ssh/id_pub.dsa",
+                        },
+                    ],
                 },
                 MatchGroup {
                     criteria: [
@@ -1570,6 +1732,7 @@ Config {
                         "forwardagent": "no",
                         "identityagent": "${HOME}/.ssh/agent",
                     },
+                    identity_files: [],
                 },
                 MatchGroup {
                     criteria: [
@@ -1588,9 +1751,11 @@ Config {
                     options: {
                         "something": "else",
                     },
+                    identity_files: [],
                 },
             ],
             loaded_files: [],
+            identity_files: [],
         },
     ],
     options: {},
@@ -1940,5 +2105,149 @@ Some(
 )
 "#
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Target tests (Wave 4): these assert the spec-correct behaviour
+    // of `Config::resolve_identity_files`, which is the typed
+    // replacement for the legacy space-concatenated ConfigMap
+    // string. Paths containing whitespace round-trip cleanly here
+    // even though the characterisation tests above still show the
+    // lossy concat on the legacy API.
+    // ---------------------------------------------------------------
+
+    fn resolve_identity_file_paths(config_str: &str) -> Vec<String> {
+        let mut config = Config::new();
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        config.assign_environment(fake_env);
+        config.add_config_string(config_str);
+        config
+            .resolve_identity_files("foo")
+            .into_iter()
+            .map(|e| e.path)
+            .collect()
+    }
+
+    #[test]
+    fn resolve_identity_files_default_list_when_empty() {
+        let paths = resolve_identity_file_paths(
+            r#"
+            Host foo
+                User me
+            "#,
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/home/me/.ssh/id_dsa".to_string(),
+                "/home/me/.ssh/id_ecdsa".to_string(),
+                "/home/me/.ssh/id_ed25519".to_string(),
+                "/home/me/.ssh/id_rsa".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_identity_files_preserves_declaration_order() {
+        let paths = resolve_identity_file_paths(
+            r#"
+            Host foo
+                IdentityFile /home/me/.ssh/first
+                IdentityFile /home/me/.ssh/second
+                IdentityFile /home/me/.ssh/third
+            "#,
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/home/me/.ssh/first".to_string(),
+                "/home/me/.ssh/second".to_string(),
+                "/home/me/.ssh/third".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_identity_files_quoted_space_is_distinct_from_separator() {
+        // The key guarantee: quoted and escaped paths containing
+        // whitespace survive as individual entries, distinct from
+        // neighbouring paths. This is the fix for the
+        // characterize_identity_file_multi_mixed_quotes info loss.
+        let paths = resolve_identity_file_paths(
+            r#"
+            Host foo
+                IdentityFile "/home/me/.ssh/first one"
+                IdentityFile /home/me/.ssh/second
+                IdentityFile /home/me/.ssh/third\ path
+            "#,
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/home/me/.ssh/first one".to_string(),
+                "/home/me/.ssh/second".to_string(),
+                "/home/me/.ssh/third path".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_identity_files_none_is_literal_at_parser_layer() {
+        // `none` special-casing happens in OpenSSH's
+        // load_public_identity_files, not at the parser. At our
+        // layer it is just another literal path entry.
+        let paths = resolve_identity_file_paths(
+            r#"
+            Host foo
+                IdentityFile /home/me/.ssh/first
+                IdentityFile none
+                IdentityFile /home/me/.ssh/second
+            "#,
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/home/me/.ssh/first".to_string(),
+                "none".to_string(),
+                "/home/me/.ssh/second".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_identity_files_file_global_first_then_host_group() {
+        // A directive outside any Host stanza applies globally and
+        // is tried before per-host entries.
+        let paths = resolve_identity_file_paths(
+            r#"
+            IdentityFile /home/me/.ssh/global_first
+
+            Host foo
+                IdentityFile /home/me/.ssh/host_second
+            "#,
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/home/me/.ssh/global_first".to_string(),
+                "/home/me/.ssh/host_second".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_identity_files_only_matching_host_contributes() {
+        let paths = resolve_identity_file_paths(
+            r#"
+            Host bar
+                IdentityFile /home/me/.ssh/bar_only
+
+            Host foo
+                IdentityFile /home/me/.ssh/foo_only
+            "#,
+        );
+        assert_eq!(paths, vec!["/home/me/.ssh/foo_only".to_string()]);
     }
 }
