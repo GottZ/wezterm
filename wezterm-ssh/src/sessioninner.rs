@@ -187,13 +187,13 @@ impl SessionInner {
         }
         for entry in &self.identity_files {
             // `AddIdentity` expects a private key path; `.pub`
-            // entries (where the user pointed IdentityFile directly
-            // at a public key file) cannot be used for signing and
-            // would be rejected or degrade the connection. Skip
-            // them here just like `pubkey_auth` does on the ssh2
-            // side. Their public blob is still picked up by the
+            // entries cannot be used for signing and would be
+            // rejected or degrade the connection. The shared
+            // helper `is_identity_file_signable` documents this
+            // invariant on both ssh2 and libssh sides. The public
+            // blob for such entries is still picked up by the
             // agent-key filter via `derive_public_blob`.
-            if entry.path.ends_with(".pub") {
+            if !crate::auth::is_identity_file_signable(entry) {
                 log::trace!(
                     "libssh backend: skipping public-only identity entry {}",
                     entry.path

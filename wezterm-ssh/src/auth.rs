@@ -11,6 +11,21 @@ pub struct AuthenticationPrompt {
     pub echo: bool,
 }
 
+/// Return `true` when an `IdentityFile` entry can be used to sign
+/// with (i.e. it names a private key, not a public one).
+///
+/// `IdentityFile` legitimately accepts a `.pub` path — the
+/// agent-key filter still reads its blob via
+/// [`derive_public_blob`] for matching — but the ssh2 backend's
+/// `userauth_pubkey_file` and libssh's `AddIdentity` both require
+/// a private-key path. Callers in the sign-capable code paths
+/// gate with this helper to skip `.pub` entries without probing
+/// bogus `<path>.pub.pub` siblings or prompting for spurious
+/// passphrases.
+pub(crate) fn is_identity_file_signable(entry: &IdentityFileEntry) -> bool {
+    !entry.path.ends_with(".pub")
+}
+
 /// Collect allowed public key blobs from a list of [`IdentityFileEntry`]
 /// values. For each entry the public key blob is obtained via
 /// [`derive_public_blob`], which follows OpenSSH's own fallback
@@ -142,13 +157,13 @@ impl crate::sessioninner::SessionInner {
         // while `tx_event.try_send` below wants &mut self access.
         let identity_files = self.identity_files.clone();
         for entry in &identity_files {
-            // If the user pointed IdentityFile directly at a `.pub`
-            // file we cannot sign with it, and `userauth_pubkey_file`
+            // Skip entries whose path points at a public key file
+            // (see `is_identity_file_signable`). `userauth_pubkey_file`
             // would otherwise probe a bogus `<path>.pub.pub` sibling
             // and likely prompt for a spurious passphrase. The
             // agent-key blob matching in `agent_auth` already handles
             // the `.pub` case correctly via `derive_public_blob`.
-            if entry.path.ends_with(".pub") {
+            if !is_identity_file_signable(entry) {
                 log::trace!(
                     "pubkey_auth: skipping public-only identity entry {}",
                     entry.path
@@ -570,7 +585,7 @@ mod tests {
         // the private half lives elsewhere or on a hardware token).
         // The typed list must still yield the blob for the agent
         // filter, even though `pubkey_auth` will skip the entry as
-        // unsignable (see the `.pub` ending check in `pubkey_auth`).
+        // unsignable (see `is_identity_file_signable`).
         let dir = tmpdir("blobs_direct_pub");
         let pub_path = dir.join("id_test.pub");
         std::fs::write(
@@ -582,6 +597,42 @@ mod tests {
         let blobs = collect_identity_blobs(&entries);
         assert_eq!(blobs.len(), 1);
         cleanup(&dir);
+    }
+
+    #[test]
+    fn is_identity_file_signable_rejects_dotpub_path() {
+        // Regression guard for the `.pub`-skip branch in
+        // `pubkey_auth` and the libssh `AddIdentity` loop. An
+        // IdentityFile that names a `.pub` file is not signable;
+        // downstream code must not pass it to
+        // `userauth_pubkey_file` or `AddIdentity`.
+        let entry = IdentityFileEntry {
+            path: "/home/me/.ssh/id_rsa.pub".to_string(),
+        };
+        assert!(!is_identity_file_signable(&entry));
+    }
+
+    #[test]
+    fn is_identity_file_signable_accepts_private_key_path() {
+        // The common case: private key path without a `.pub`
+        // suffix. Must stay signable so `pubkey_auth` actually
+        // tries it.
+        let entry = IdentityFileEntry {
+            path: "/home/me/.ssh/id_rsa".to_string(),
+        };
+        assert!(is_identity_file_signable(&entry));
+    }
+
+    #[test]
+    fn is_identity_file_signable_accepts_path_with_pub_in_middle() {
+        // Only the `.pub` *suffix* disqualifies a path; an
+        // infix `pub` somewhere in the middle of the filename
+        // stays signable. This pins the end-suffix semantics
+        // against any future temptation to use `.contains(".pub")`.
+        let entry = IdentityFileEntry {
+            path: "/home/me/.ssh/id_pub_key_2024".to_string(),
+        };
+        assert!(is_identity_file_signable(&entry));
     }
 
     #[test]
