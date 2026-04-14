@@ -483,8 +483,7 @@ impl CursorTrailState {
 
             let phase = if let Some(pending) = self.pending_jump {
                 let returned = pending.from.x == current.x && pending.from.y == current.y;
-                let timed_out =
-                    now.duration_since(pending.started_at).as_secs_f32() >= anim_length;
+                let timed_out = now.duration_since(pending.started_at).as_secs_f32() >= anim_length;
                 if returned {
                     self.pending_jump = None;
                     Phase::Snap
