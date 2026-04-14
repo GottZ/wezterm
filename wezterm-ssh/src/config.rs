@@ -443,7 +443,19 @@ impl ParsedConfigFile {
             let tokens = match crate::tokenizer::argv_split(rest, true) {
                 Ok(t) => t,
                 Err(err) => {
-                    log::warn!("ssh_config: ignoring line with {}: {:?}", err, line);
+                    // OpenSSH aborts the whole config load here with
+                    // "bad configuration options". We cannot
+                    // propagate that without breaking the public
+                    // API (`Config::add_config_string` and
+                    // `add_config_file` are `()`-returning), so we
+                    // drop the offending line and raise the log
+                    // level from `warn` to `error` so the user
+                    // actually notices that a directive vanished.
+                    log::error!(
+                        "ssh_config: dropping line with {} — this directive will not take effect: {:?}",
+                        err,
+                        line
+                    );
                     continue;
                 }
             };

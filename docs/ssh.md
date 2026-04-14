@@ -89,9 +89,15 @@ rules:
   A `#` that appears inside quotes, inside a `${VAR}` reference, or
   in the middle of an unquoted token is preserved literally — paths
   containing `#` in their middle do not need to be quoted.
-* Unbalanced quotes are a hard error; the offending line is skipped
-  with a warning in the log rather than silently stored as part of the
-  value.
+* A line with unbalanced quotes is dropped entirely and a
+  `log::error!` is emitted identifying the offending line. OpenSSH
+  itself aborts the whole config load in this case with "bad
+  configuration options"; wezterm keeps the rest of the config
+  working (because `Config::add_config_string` and friends have no
+  error-return path) but raises the log level so the user notices
+  that a directive vanished. If an `IdentityFile` or similar
+  directive silently seems to have no effect, the error log is the
+  first place to check.
 
 Multiple `IdentityFile` directives accumulate as an ordered list and
 are tried in the order they were declared (file-global first, then
