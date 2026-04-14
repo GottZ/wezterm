@@ -47,6 +47,30 @@ fn read_identity_file_capped(path: &Path) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Error variants produced by [`parse_openssh_envelope_pubkey`]
+/// when walking the unencrypted header of an OpenSSH private key
+/// file. `pub(crate)` so it can appear as the source of
+/// [`DerivePubkeyError::Parse`] (which is itself crate-internal
+/// because the module is not re-exported); not part of the public
+/// crate API.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EnvelopeParseError {
+    #[error("invalid or missing PEM wrapper")]
+    InvalidPem,
+    #[error("invalid base64 in PEM body")]
+    InvalidBase64,
+    #[error("not an openssh-key-v1 envelope")]
+    InvalidMagic,
+    #[error("truncated envelope")]
+    Truncated,
+    #[error("unsupported key count: {0}")]
+    UnsupportedKeyCount(u32),
+    #[error("string field too large: {0}")]
+    StringTooLarge(u32),
+    #[error("public key blob too large: {0}")]
+    PublicKeyTooLarge(u32),
+}
+
 /// Error type returned by [`derive_public_blob`].
 #[derive(Debug, thiserror::Error)]
 pub enum DerivePubkeyError {
@@ -54,14 +78,124 @@ pub enum DerivePubkeyError {
     Parse {
         path: String,
         #[source]
-        source: ssh_key::Error,
+        source: EnvelopeParseError,
     },
-    #[error("failed to encode public key for {path:?}: {source}")]
-    Encode {
-        path: String,
-        #[source]
-        source: ssh_key::Error,
-    },
+}
+
+/// Bounded cursor over a byte slice with SSH-primitive readers.
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], EnvelopeParseError> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or(EnvelopeParseError::Truncated)?;
+        if end > self.buf.len() {
+            return Err(EnvelopeParseError::Truncated);
+        }
+        let out = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn read_u32(&mut self) -> Result<u32, EnvelopeParseError> {
+        let b = self.read_bytes(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn read_string(&mut self) -> Result<&'a [u8], EnvelopeParseError> {
+        // OpenSSH's own sanity cap on string lengths. Anything
+        // larger is malformed or adversarial; real ciphername /
+        // kdfname / kdfoptions values are < 100 bytes.
+        const MAX_STRING: u32 = 65536;
+        let len = self.read_u32()?;
+        if len > MAX_STRING {
+            return Err(EnvelopeParseError::StringTooLarge(len));
+        }
+        self.read_bytes(len as usize)
+    }
+}
+
+/// Strip the PEM wrapper and base64-decode the body of an OpenSSH
+/// private key file. Tolerates LF / CRLF / other whitespace inside
+/// the body.
+fn strip_pem_wrapper(raw: &[u8]) -> Result<Vec<u8>, EnvelopeParseError> {
+    const BEGIN: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    const END: &str = "-----END OPENSSH PRIVATE KEY-----";
+
+    let text = std::str::from_utf8(raw).map_err(|_| EnvelopeParseError::InvalidPem)?;
+    let begin = text.find(BEGIN).ok_or(EnvelopeParseError::InvalidPem)?;
+    let after_begin = begin + BEGIN.len();
+    let end_rel = text[after_begin..]
+        .find(END)
+        .ok_or(EnvelopeParseError::InvalidPem)?;
+    let body = &text[after_begin..after_begin + end_rel];
+
+    let cleaned: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(cleaned.as_bytes())
+        .map_err(|_| EnvelopeParseError::InvalidBase64)
+}
+
+/// Parse the unencrypted header of an OpenSSH-format private key
+/// file and return the embedded SSH-wire-format public key blob.
+///
+/// The public key lives in the envelope **before** the encrypted
+/// private section, so this function works against passphrase-
+/// protected keys without ever touching the encrypted bytes. It is
+/// a byte-compatible minimal port of `sshkey_parse_private2_pubkey`
+/// in `openssh-portable/sshkey.c`, covering exactly the fields we
+/// need:
+///
+/// - `magic` (15 bytes, must equal `"openssh-key-v1\0"`)
+/// - `ciphername`, `kdfname`, `kdfoptions` (SSH strings, ignored)
+/// - `num_keys` (u32, must equal 1 — OpenSSH always writes 1)
+/// - `publickey` (SSH string, **returned as-is**)
+///
+/// No interpretation of the blob itself: algorithm-specific
+/// decoding happens in whoever consumes the result (the
+/// `sshkey_equal`-equivalent comparison in the agent-key filter).
+fn parse_openssh_envelope_pubkey(raw: &[u8]) -> Result<Vec<u8>, EnvelopeParseError> {
+    const MAGIC: &[u8] = b"openssh-key-v1\0";
+    // Generous cap: RSA-16384 produces ~2 KiB of SSH-wire public
+    // key material. 32 KiB is an order of magnitude above anything
+    // realistic, while still protecting against adversarial
+    // `u32::MAX` length fields.
+    const MAX_PUBKEY: u32 = 32768;
+
+    let decoded = strip_pem_wrapper(raw)?;
+    let mut cur = Cursor::new(&decoded);
+
+    if cur.read_bytes(MAGIC.len())? != MAGIC {
+        return Err(EnvelopeParseError::InvalidMagic);
+    }
+
+    // Skip cipher / kdf metadata — we do not interpret them
+    // because we never decrypt anything.
+    let _ciphername = cur.read_string()?;
+    let _kdfname = cur.read_string()?;
+    let _kdfoptions = cur.read_string()?;
+
+    let num_keys = cur.read_u32()?;
+    if num_keys != 1 {
+        return Err(EnvelopeParseError::UnsupportedKeyCount(num_keys));
+    }
+
+    let pk_len = cur.read_u32()?;
+    if pk_len > MAX_PUBKEY {
+        return Err(EnvelopeParseError::PublicKeyTooLarge(pk_len));
+    }
+
+    Ok(cur.read_bytes(pk_len as usize)?.to_vec())
 }
 
 /// Try to produce the SSH-wire-format public key blob for the key
@@ -112,15 +246,8 @@ pub fn derive_public_blob(path: &Path) -> Result<Option<Vec<u8>>, DerivePubkeyEr
     // lives in the envelope header before the encrypted key data.
     if let Some(bytes) = path_bytes {
         let path_str = path.to_string_lossy().into_owned();
-        match ssh_key::PrivateKey::from_openssh(bytes.as_slice()) {
-            Ok(private) => {
-                let public = private.public_key();
-                let blob = public
-                    .to_bytes()
-                    .map_err(|source| DerivePubkeyError::Encode {
-                        path: path_str,
-                        source,
-                    })?;
+        match parse_openssh_envelope_pubkey(&bytes) {
+            Ok(blob) => {
                 log::trace!(
                     "pubkey for {:?}: strategy 3 (from OpenSSH private key envelope)",
                     path.display()
