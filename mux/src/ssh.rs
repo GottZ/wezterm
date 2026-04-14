@@ -212,18 +212,28 @@ pub fn ssh_domain_to_host_options(ssh_dom: &SshDomain) -> anyhow::Result<HostOpt
         .to_string(),
     );
     for (k, v) in &ssh_dom.ssh_option {
-        // IdentityFile overrides coming in via `-o` on the command
-        // line are accumulated into the typed list so that repeated
-        // `-o IdentityFile=...` flags stack (wave 6 fix for the CLI
-        // clobber bug in wezterm-gui/src/main.rs). `push_identity_file`
-        // keeps the legacy `ConfigMap` view in sync so that any
-        // downstream code still reading the flat map observes the
-        // override as well.
+        // Legacy path: a single `identityfile` key routed through
+        // the flat `HashMap<String,String>`. The CLI now splits
+        // `-o IdentityFile=...` into `ssh_dom.identity_files`
+        // instead (see wezterm-gui/src/main.rs), but Lua configs
+        // that still write `ssh_option = { identityfile = ... }`
+        // keep working here. `push_identity_file` synchronises the
+        // typed list and the legacy flat map.
         if k.eq_ignore_ascii_case("identityfile") {
             host_options.push_identity_file(v.clone());
             continue;
         }
         host_options.options.insert(k.to_string(), v.to_string());
+    }
+
+    // Typed identity file list: populated from `-o IdentityFile=...`
+    // CLI overrides via `wezterm-gui/src/main.rs::async_run_ssh` and/or
+    // from Lua configs that set `SshDomain.identity_files` directly.
+    // Appended after `ssh_option` so the declaration order is
+    // preserved end-to-end into `HostOptions::identity_files`, and
+    // `push_identity_file` keeps the legacy flat-map view in sync.
+    for identity_file in &ssh_dom.identity_files {
+        host_options.push_identity_file(identity_file.clone());
     }
 
     if let Some(username) = &ssh_dom.username {
@@ -1166,5 +1176,75 @@ impl std::io::Read for PtyReader {
                 _ => res,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_domain_identity_files_stack_into_typed_host_options() {
+        // Non-breaking regression guard for the C1 fix from the
+        // 24-agent review armada on PR #7739: repeated
+        // `wezterm ssh -o IdentityFile=...` CLI overrides are
+        // filtered into `SshDomain.identity_files` before the
+        // flat `ssh_option` HashMap can clobber them, and the
+        // consumption loop in `ssh_domain_to_host_options` then
+        // stacks them into `HostOptions::identity_files` in
+        // declaration order via `push_identity_file`.
+        //
+        // Pins four invariants at once:
+        // 1. The additive `identity_files` field deserialises via
+        //    `..Default::default()` without any Lua input — proving
+        //    the `#[dynamic(default)]` compat promise holds.
+        // 2. Every entry reaches the typed list.
+        // 3. Declaration order is preserved end-to-end.
+        // 4. `push_identity_file` keeps the legacy
+        //    `options["identityfile"]` view in sync with the typed
+        //    list so downstream readers of the flat map observe
+        //    the overrides as well.
+        let dom = SshDomain {
+            name: "test".to_string(),
+            remote_address: "example.invalid".to_string(),
+            identity_files: vec![
+                "/home/me/.ssh/cli_first".to_string(),
+                "/home/me/.ssh/cli_second".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let host_options = ssh_domain_to_host_options(&dom).expect("ssh_domain_to_host_options");
+
+        let paths: Vec<&str> = host_options
+            .identity_files
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect();
+
+        let first_idx = paths
+            .iter()
+            .position(|p| *p == "/home/me/.ssh/cli_first")
+            .expect("first CLI identity file must survive into the typed list");
+        let second_idx = paths
+            .iter()
+            .position(|p| *p == "/home/me/.ssh/cli_second")
+            .expect("second CLI identity file must survive into the typed list");
+        assert!(
+            first_idx < second_idx,
+            "CLI declaration order must be preserved, got {:?}",
+            paths
+        );
+
+        let flat = host_options
+            .options
+            .get("identityfile")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            flat.contains("/home/me/.ssh/cli_first") && flat.contains("/home/me/.ssh/cli_second"),
+            "push_identity_file must keep the legacy ConfigMap view in sync, got {:?}",
+            flat
+        );
     }
 }
