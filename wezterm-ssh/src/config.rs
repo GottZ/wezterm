@@ -1096,7 +1096,7 @@ impl Config {
     fn should_expand_tokens(&self, key: &str) -> Option<&[&str]> {
         match key {
             "certificatefile" | "controlpath" | "identityagent" | "identityfile"
-            | "localforward" | "remotecommand" | "remoteforward" | "userknownkostsfile" => {
+            | "localforward" | "remotecommand" | "remoteforward" | "userknownhostsfile" => {
                 Some(&["%C", "%d", "%h", "%i", "%L", "%l", "%n", "%p", "%r", "%u"])
             }
             "hostname" => Some(&["%h"]),
@@ -1561,6 +1561,38 @@ Config {
     "userknownhostsfile": "/home/me/.ssh/known_hosts /home/me/.ssh/known_hosts2",
 }
 "#
+        );
+    }
+
+    #[test]
+    fn userknownhostsfile_expands_host_token() {
+        let mut config = Config::new();
+
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        config.assign_environment(fake_env);
+
+        config.add_config_string(
+            r#"
+        Host example.com
+            UserKnownHostsFile ~/.ssh/known_hosts.%h
+            "#,
+        );
+
+        let opts = config.for_host("example.com");
+        let value = opts
+            .get("userknownhostsfile")
+            .expect("userknownhostsfile should be set");
+        assert!(
+            value.contains("example.com"),
+            "expected %h to expand to example.com, got {:?}",
+            value
+        );
+        assert!(
+            !value.contains("%h"),
+            "expected %h token to be expanded, got {:?}",
+            value
         );
     }
 
