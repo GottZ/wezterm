@@ -238,131 +238,166 @@ impl ParsedConfigFile {
                 continue;
             }
 
-            if let Some(sep) = line.find(|c: char| c == '=' || c.is_whitespace()) {
-                let (k, v) = line.split_at(sep);
-                let k = k.trim().to_lowercase();
-                let v = v[1..].trim();
+            let Some(sep) = line.find(|c: char| c == '=' || c.is_whitespace()) else {
+                continue;
+            };
+            let (k, rest) = line.split_at(sep);
+            let key = k.trim().to_lowercase();
+            let rest = rest[1..].trim_start();
 
-                let v = if v.starts_with('"') && v.ends_with('"') {
-                    &v[1..v.len() - 1]
-                } else {
-                    v
-                };
+            let tokens = match crate::tokenizer::argv_split(rest, true) {
+                Ok(t) => t,
+                Err(err) => {
+                    log::warn!("ssh_config: ignoring line with {}: {:?}", err, line);
+                    continue;
+                }
+            };
 
-                fn parse_pattern_list(v: &str) -> Vec<Pattern> {
-                    let mut patterns = vec![];
-                    for p in v.split(',') {
-                        let p = p.trim();
-                        if p.starts_with('!') {
-                            patterns.push(Pattern::new(&p[1..], true));
+            if tokens.is_empty() {
+                continue;
+            }
+
+            fn parse_pattern_list(v: &str) -> Vec<Pattern> {
+                let mut patterns = vec![];
+                for p in v.split(',') {
+                    let p = p.trim();
+                    if let Some(stripped) = p.strip_prefix('!') {
+                        patterns.push(Pattern::new(stripped, true));
+                    } else {
+                        patterns.push(Pattern::new(p, false));
+                    }
+                }
+                patterns
+            }
+
+            fn patterns_from_tokens(tokens: &[String]) -> Vec<Pattern> {
+                tokens
+                    .iter()
+                    .map(|t| {
+                        if let Some(stripped) = t.strip_prefix('!') {
+                            Pattern::new(stripped, true)
                         } else {
-                            patterns.push(Pattern::new(p, false));
+                            Pattern::new(t, false)
                         }
-                    }
-                    patterns
+                    })
+                    .collect()
+            }
+
+            if key == "include" {
+                for token in &tokens {
+                    Self::do_include(token, cwd, options, groups, loaded_files);
                 }
-                fn parse_whitespace_pattern_list(v: &str) -> Vec<Pattern> {
-                    let mut patterns = vec![];
-                    for p in v.split_ascii_whitespace() {
-                        let p = p.trim();
-                        if p.starts_with('!') {
-                            patterns.push(Pattern::new(&p[1..], true));
-                        } else {
-                            patterns.push(Pattern::new(p, false));
+                continue;
+            }
+
+            if key == "host" {
+                groups.push(MatchGroup {
+                    criteria: vec![Criteria::Host(patterns_from_tokens(&tokens))],
+                    options: ConfigMap::new(),
+                    context: Context::FirstPass,
+                });
+                continue;
+            }
+
+            if key == "match" {
+                let mut criteria = vec![];
+                let mut context = Context::FirstPass;
+                let mut iter = tokens.iter();
+
+                while let Some(cname) = iter.next() {
+                    match cname.to_lowercase().as_str() {
+                        "all" => {
+                            criteria.push(Criteria::All);
                         }
-                    }
-                    patterns
-                }
-
-                if k == "include" {
-                    Self::do_include(v, cwd, options, groups, loaded_files);
-                    continue;
-                }
-
-                if k == "host" {
-                    let patterns = parse_whitespace_pattern_list(v);
-                    groups.push(MatchGroup {
-                        criteria: vec![Criteria::Host(patterns)],
-                        options: ConfigMap::new(),
-                        context: Context::FirstPass,
-                    });
-                    continue;
-                }
-
-                if k == "match" {
-                    let mut criteria = vec![];
-                    let mut context = Context::FirstPass;
-
-                    let mut tokens = v.split_ascii_whitespace();
-
-                    while let Some(cname) = tokens.next() {
-                        match cname.to_lowercase().as_str() {
-                            "all" => {
-                                criteria.push(Criteria::All);
-                            }
-                            "canonical" => {
-                                context = Context::Canonical;
-                            }
-                            "final" => {
-                                context = Context::Final;
-                            }
-                            "exec" => {
-                                criteria.push(Criteria::Exec(
-                                    tokens.next().unwrap_or("false").to_string(),
-                                ));
-                            }
-                            "host" => {
-                                criteria.push(Criteria::Host(parse_pattern_list(
-                                    tokens.next().unwrap_or(""),
-                                )));
-                            }
-                            "originalhost" => {
-                                criteria.push(Criteria::OriginalHost(parse_pattern_list(
-                                    tokens.next().unwrap_or(""),
-                                )));
-                            }
-                            "user" => {
-                                criteria.push(Criteria::User(parse_pattern_list(
-                                    tokens.next().unwrap_or(""),
-                                )));
-                            }
-                            "localuser" => {
-                                criteria.push(Criteria::LocalUser(parse_pattern_list(
-                                    tokens.next().unwrap_or(""),
-                                )));
-                            }
-                            _ => break,
+                        "canonical" => {
+                            context = Context::Canonical;
                         }
+                        "final" => {
+                            context = Context::Final;
+                        }
+                        "exec" => {
+                            criteria.push(Criteria::Exec(
+                                iter.next().cloned().unwrap_or_else(|| "false".to_string()),
+                            ));
+                        }
+                        "host" => {
+                            criteria.push(Criteria::Host(parse_pattern_list(
+                                iter.next().map(String::as_str).unwrap_or(""),
+                            )));
+                        }
+                        "originalhost" => {
+                            criteria.push(Criteria::OriginalHost(parse_pattern_list(
+                                iter.next().map(String::as_str).unwrap_or(""),
+                            )));
+                        }
+                        "user" => {
+                            criteria.push(Criteria::User(parse_pattern_list(
+                                iter.next().map(String::as_str).unwrap_or(""),
+                            )));
+                        }
+                        "localuser" => {
+                            criteria.push(Criteria::LocalUser(parse_pattern_list(
+                                iter.next().map(String::as_str).unwrap_or(""),
+                            )));
+                        }
+                        _ => break,
                     }
-
-                    groups.push(MatchGroup {
-                        criteria,
-                        options: ConfigMap::new(),
-                        context,
-                    });
-                    continue;
                 }
 
-                fn add_option(options: &mut ConfigMap, k: String, v: &str) {
-                    // first option wins in ssh_config, except for identityfile
-                    // which explicitly allows multiple entries to combine together
-                    let is_identity_file = k == "identityfile";
-                    options
-                        .entry(k)
-                        .and_modify(|e| {
-                            if is_identity_file {
-                                e.push(' ');
-                                e.push_str(v);
-                            }
-                        })
-                        .or_insert_with(|| v.to_string());
-                }
+                groups.push(MatchGroup {
+                    criteria,
+                    options: ConfigMap::new(),
+                    context,
+                });
+                continue;
+            }
 
-                if let Some(group) = groups.last_mut() {
-                    add_option(&mut group.options, k, v);
-                } else {
-                    add_option(options, k, v);
+            // Command directives (ProxyCommand, LocalCommand,
+            // RemoteCommand, KnownHostsCommand) take the raw
+            // remainder of the line verbatim so that shell-style
+            // arguments and trailing `#` characters survive intact,
+            // matching OpenSSH's `parse_command` branch in
+            // readconf.c:1531.
+            let is_command_directive = matches!(
+                key.as_str(),
+                "proxycommand" | "localcommand" | "remotecommand" | "knownhostscommand"
+            );
+            let value: String = if is_command_directive {
+                rest.to_string()
+            } else {
+                // Single-token directive. OpenSSH errors on extra
+                // arguments; until wave 4 introduces typed
+                // multi-value fields we warn and keep the first
+                // token.
+                if tokens.len() > 1 {
+                    log::warn!(
+                        "ssh_config: keyword {:?} takes one argument per line; ignoring extras: {:?}",
+                        key,
+                        &tokens[1..]
+                    );
                 }
+                tokens[0].clone()
+            };
+
+            fn add_option(options: &mut ConfigMap, k: String, v: &str) {
+                // first option wins in ssh_config, except for identityfile
+                // which explicitly allows multiple entries to combine together
+                let is_identity_file = k == "identityfile";
+                options
+                    .entry(k)
+                    .and_modify(|e| {
+                        if is_identity_file {
+                            e.push(' ');
+                            e.push_str(v);
+                        }
+                    })
+                    .or_insert_with(|| v.to_string());
+            }
+
+            if let Some(group) = groups.last_mut() {
+                add_option(&mut group.options, key, &value);
+            } else {
+                add_option(options, key, &value);
             }
         }
     }
@@ -1714,7 +1749,7 @@ Some(
             ident,
             r#"
 Some(
-    "/home/me/.ssh/path\\ with\\ space/id_rsa",
+    "/home/me/.ssh/path with space/id_rsa",
 )
 "#
         );
@@ -1735,7 +1770,7 @@ Some(
             ident,
             r#"
 Some(
-    "'/home/me/.ssh/single quoted'",
+    "/home/me/.ssh/single quoted",
 )
 "#
         );
@@ -1758,7 +1793,7 @@ Some(
             ident,
             r#"
 Some(
-    "/home/me/.ssh/first /home/me/.ssh/second",
+    "/home/me/.ssh/first",
 )
 "#
         );
@@ -1808,7 +1843,7 @@ Some(
             ident,
             r#"
 Some(
-    "/home/me/.ssh/first one /home/me/.ssh/second /home/me/.ssh/third\\ path",
+    "/home/me/.ssh/first one /home/me/.ssh/second /home/me/.ssh/third path",
 )
 "#
         );
@@ -1857,7 +1892,7 @@ Some(
             ident,
             r#"
 Some(
-    ""/home/me/.ssh/unclosed",
+    "/home/me/.ssh/id_dsa /home/me/.ssh/id_ecdsa /home/me/.ssh/id_ed25519 /home/me/.ssh/id_rsa",
 )
 "#
         );
@@ -1878,7 +1913,7 @@ Some(
             ident,
             r#"
 Some(
-    "/home/me/.ssh/id_rsa # trailing comment",
+    "/home/me/.ssh/id_rsa",
 )
 "#
         );
