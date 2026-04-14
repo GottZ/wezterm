@@ -136,6 +136,29 @@ impl IdentityFileEntry {
 /// contain spaces — new code should go through `resolve_host`
 /// whenever possible.
 ///
+/// # Invariant: typed list ↔ flat map
+///
+/// The typed [`Self::identity_files`] list and the legacy
+/// `options["identityfile"]` string are kept in sync by every
+/// mutation site in this crate. The contract is:
+///
+/// * **Source of truth**: `identity_files` holds the canonical,
+///   tokeniser-correct view. `options["identityfile"]` is a
+///   space-joined legacy serialisation for downstream code that
+///   still reads the flat `ConfigMap`.
+/// * **Mutation through [`Self::push_identity_file`]**: when you
+///   add a new entry (e.g. in a `-o IdentityFile=...` CLI override
+///   handler), go through the helper. It updates both views
+///   atomically and is the only code path guaranteed to keep them
+///   consistent.
+/// * **Direct field access is allowed but dangerous**: the fields
+///   are `pub` so that existing callers (and serialisation-driven
+///   Lua config) do not break, but touching them bypasses the
+///   invariant. Tests and diagnostics may read them freely; code
+///   that pushes new entries should use `push_identity_file`.
+///
+/// # Example
+///
 /// ```no_run
 /// use wezterm_ssh::{Config, Session};
 ///
@@ -148,10 +171,22 @@ impl IdentityFileEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HostOptions {
     /// Flat key-value options as produced by [`Config::for_host`].
+    ///
+    /// This is a legacy representation that cannot losslessly
+    /// round-trip `IdentityFile` paths containing whitespace — see
+    /// the struct-level doc on the typed-list-vs-flat-map
+    /// invariant. Prefer [`Self::identity_files`] for
+    /// `IdentityFile` reads and [`Self::push_identity_file`] for
+    /// writes.
     pub options: ConfigMap,
     /// `IdentityFile` entries in OpenSSH declaration order (file
     /// global first, then matching stanzas), with the built-in
     /// defaults applied when no directive matched.
+    ///
+    /// Canonical source of truth. Safe to read freely; when
+    /// appending new entries, use
+    /// [`Self::push_identity_file`] so that the legacy
+    /// `options["identityfile"]` view stays in sync.
     pub identity_files: Vec<IdentityFileEntry>,
 }
 
