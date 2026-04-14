@@ -163,6 +163,26 @@ As features stabilize some brief notes about them will accumulate here.
   `sshkey_load_pubkey_from_private()` behaviour. Works for passphrase-
   protected keys without prompting and removes the previous "run
   `ssh-keygen -y` by hand" workaround. Refs #7423. Thanks to @GottZ!
+* SSH: the `ssh-key` crate dependency has been replaced with a ~150-line
+  in-tree OpenSSH envelope parser that reads only the unencrypted public
+  key blob from `openssh-key-v1`-format private key files. This drops
+  ~15 transitive RustCrypto crates (including `ed25519-dalek`,
+  `curve25519-dalek`, `rsa`, `num-bigint-dig`, `pkcs1`/`pkcs8`/`spki`,
+  `sec1`, and the `p256`/`p384`/`p521` elliptic-curve crates) from
+  wezterm's dependency tree without changing observable behaviour. The
+  test matrix for the new parser covers ed25519 (plain + passphrase),
+  ECDSA p256/p384/p521, and RSA 2048/3072/4096 (plain + passphrase),
+  plus three negative envelope-shape tests. Thanks to @GottZ!
+* SSH: `id_dsa` is now **deprecated** as part of the default identity
+  list. DSA was disabled at the protocol level in OpenSSH in 2015 and
+  has been progressively removed across OpenSSH 9.x releases; the new
+  in-tree envelope parser does not understand DSA's PEM-PKCS#8 layout
+  (DSA never used `openssh-key-v1`), so the agent-key filter for
+  `IdentitiesOnly=yes` cannot match a DSA identity even today. The
+  path is kept in the default list for now to avoid breaking any setup
+  that still relies on the ssh2/libssh backends' native DSA loaders,
+  but new configurations should not depend on it and the entry will be
+  removed in a future release. Thanks to @GottZ!
 * Race condition when very quickly adjusting font scale, and other improvements
   around resizing. Thanks to @jknockel! #4876 #5032 #5033
 * macOS: wacky initial window size with external monitors or certain font

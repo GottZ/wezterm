@@ -834,6 +834,21 @@ impl Config {
 
         if entries.is_empty() {
             if let Some(home) = self.resolve_home() {
+                // The OpenSSH default identity list. `id_dsa` is
+                // **deprecated** and slated for removal in a future
+                // wezterm release: OpenSSH itself disabled DSA at the
+                // protocol level in 2015 and has been removing
+                // remaining DSA support across releases since
+                // OpenSSH 9.x. The new in-tree envelope parser in
+                // `pubkey_from_private` does not understand DSA's
+                // PEM-PKCS#8 layout (DSA keys never use the
+                // `openssh-key-v1` format), so the agent-key filter
+                // for `IdentitiesOnly=yes` cannot match a DSA
+                // identity even today. The path is kept in the
+                // default list for now to avoid breaking any setup
+                // that still relies on the ssh2/libssh backends'
+                // native DSA loaders, but new configurations should
+                // not depend on it.
                 for name in ["id_dsa", "id_ecdsa", "id_ed25519", "id_rsa"] {
                     entries.push(IdentityFileEntry::new(format!("{}/.ssh/{}", home, name)));
                 }
@@ -1043,6 +1058,11 @@ impl Config {
 
         if !result.contains_key("identityfile") {
             if let Some(home) = self.resolve_home() {
+                // Mirrors the typed default list in
+                // `collect_raw_identity_files`. `id_dsa` is
+                // deprecated (see the longer notice on that helper)
+                // and will be dropped in a future wezterm release;
+                // for now both views agree to avoid drift.
                 result.insert(
                     "identityfile".to_string(),
                     format!(
