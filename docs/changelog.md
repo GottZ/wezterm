@@ -145,6 +145,24 @@ As features stabilize some brief notes about them will accumulate here.
 * SSH: `IdentitiesOnly=yes` now correctly filters agent keys to those matching
   configured `IdentityFile` entries, rather than skipping agent authentication
   entirely. Thanks to @GottZ! #7739
+* SSH: the `ssh_config` parser now follows OpenSSH's `argv_split` rules for
+  directive arguments: double and single quotes and backslash escapes are
+  honoured, trailing `#` comments are stripped, and unbalanced quotes are
+  rejected. Fixes `IdentityFile` paths containing whitespace (#7648),
+  correctly accumulates multiple `IdentityFile` directives (#6216), and
+  resolves parsing glitches around `Match exec` and `ProxyCommand`
+  (#5755, refs #5980). Thanks to @GottZ!
+* SSH: `IdentityFile` entries are now stored as a typed, ordered list
+  internally, preserving declaration order and tolerating paths with
+  whitespace end-to-end from parser through agent-key filtering and pubkey
+  auth. Multiple `-o IdentityFile=...` CLI overrides now accumulate instead
+  of clobbering each other. Thanks to @GottZ!
+* SSH: the public key blob needed for `IdentitiesOnly` agent-key matching is
+  now derived from the OpenSSH private key envelope when no `.pub` file is
+  present alongside it, mirroring OpenSSH's own
+  `sshkey_load_pubkey_from_private()` behaviour. Works for passphrase-
+  protected keys without prompting and removes the previous "run
+  `ssh-keygen -y` by hand" workaround. Refs #7423. Thanks to @GottZ!
 * Race condition when very quickly adjusting font scale, and other improvements
   around resizing. Thanks to @jknockel! #4876 #5032 #5033
 * macOS: wacky initial window size with external monitors or certain font

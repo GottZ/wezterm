@@ -62,15 +62,47 @@ All other options are parsed but have no effect.  Notably, neither `Match` or
 `IdentitiesOnly` is now correctly supported in the ssh2 backend when using agent authentication.
 When `IdentitiesOnly=yes` is set in your ssh config, wezterm will filter the
 keys offered by the SSH agent to only those whose public key matches a
-configured `IdentityFile` entry (checking both the private key file and the
-corresponding `.pub` file).  Previously, `IdentitiesOnly=yes` caused agent
+configured `IdentityFile` entry.  Previously, `IdentitiesOnly=yes` caused agent
 authentication to be skipped entirely. This also solves using YubiKeys, GPG, etc.
 
-!!! note
-    wezterm does not derive public keys automatically. If your `IdentityFile`
-    points to a private key without a corresponding `.pub` file alongside it,
-    the key will not be matched against the agent. Generate the public key file
-    with `ssh-keygen -y -f /path/to/key > /path/to/key.pub`.
+wezterm follows OpenSSH's own fallback order when locating the public key
+material for an `IdentityFile` entry: first the file is tried as a public key
+(so pointing `IdentityFile` directly at a `.pub` file works); then the
+`<path>.pub` sibling is checked; and finally the public key is extracted from
+the unencrypted envelope of the OpenSSH private key format, which works even
+for passphrase-protected keys without prompting for the passphrase. No manual
+`ssh-keygen -y` step is required.
+
+Quoting in `ssh_config` values now follows OpenSSH's `argv_split`
+rules:
+
+* Double and single quotes are both honoured and are stripped from the
+  stored value. `IdentityFile "/home/me/.ssh/path with space/id_rsa"`
+  and `IdentityFile '/home/me/.ssh/path with space/id_rsa'` both yield
+  the literal path `/home/me/.ssh/path with space/id_rsa`.
+* Backslash escapes `\\`, `\"`, `\'` work inside and outside quotes;
+  `\ ` (backslash followed by a space) works only outside quotes. For
+  example `IdentityFile /home/me/.ssh/path\ with\ space/id_rsa`
+  resolves to the same path as the quoted form above.
+* An unquoted `#` terminates the line as a comment. A `#` inside
+  quotes is taken literally, so paths containing `#` need to be
+  quoted.
+* Unbalanced quotes are a hard error; the offending line is skipped
+  with a warning in the log rather than silently stored as part of the
+  value.
+
+Multiple `IdentityFile` directives accumulate as an ordered list and
+are tried in the order they were declared (file-global first, then
+each matching `Host`/`Match` stanza in the sequence they appear in
+the config). Paths containing whitespace round-trip cleanly through
+this typed list all the way to the ssh2 and libssh backends, so they
+no longer collide with the separator used by the legacy
+space-concatenated representation.
+
+Repeated `-o IdentityFile=...` overrides on the command line
+(e.g. `wezterm ssh -o IdentityFile=~/.ssh/key_a -o
+IdentityFile=~/.ssh/key_b user@host`) now stack into that same
+ordered list instead of the second override clobbering the first.
 
 `ServerAliveInterval` is now supported by the `libssh` backend.  Setting it to
 a non-zero value will cause wezterm to send an `IGNORE` packet on that interval.

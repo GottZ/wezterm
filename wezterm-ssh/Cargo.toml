@@ -35,6 +35,7 @@ regex.workspace = true
 smol.workspace = true
 socket2.workspace = true
 sha2.workspace = true
+ssh-key = { version = "0.6", default-features = false, features = ["std", "alloc", "ed25519", "ecdsa", "rsa"] }
 ssh2 = {workspace=true, features=["openssl-on-win32"], optional = true}
 thiserror.workspace = true
 wezterm-uds.workspace = true

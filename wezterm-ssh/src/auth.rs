@@ -1,7 +1,9 @@
 use crate::config::IdentityFileEntry;
+use crate::pubkey_from_private::derive_public_blob;
 use crate::session::SessionEvent;
 use anyhow::Context;
 use smol::channel::{bounded, Sender};
+use std::path::Path;
 
 #[derive(Debug)]
 pub struct AuthenticationPrompt {
@@ -9,29 +11,34 @@ pub struct AuthenticationPrompt {
     pub echo: bool,
 }
 
-/// Try to extract the public key blob from an OpenSSH-format public key string.
-/// The expected format is: `<algo> <base64-blob> [comment]`
-#[cfg(feature = "ssh2")]
-fn parse_pub_key_blob(content: &str) -> Option<Vec<u8>> {
-    let b64 = content.split_whitespace().nth(1)?;
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(b64).ok()
-}
-
 /// Collect allowed public key blobs from a list of [`IdentityFileEntry`]
-/// values. For each entry we check both the path as-is and with a `.pub`
-/// suffix appended, returning the first successfully parsed blob.
+/// values. For each entry the public key blob is obtained via
+/// [`derive_public_blob`], which follows OpenSSH's own fallback
+/// order (file-as-pub → sibling `.pub` → envelope of the private
+/// key), so hardware-backed and passphrase-protected keys no longer
+/// require a pre-generated `.pub` file sitting next to them.
 #[cfg(feature = "ssh2")]
 fn collect_identity_blobs(identity_files: &[IdentityFileEntry]) -> Vec<Vec<u8>> {
     let mut blobs = Vec::new();
     for entry in identity_files {
-        for path in &[entry.path.clone(), format!("{}.pub", entry.path)] {
-            if let Ok(s) = std::fs::read_to_string(path) {
-                if let Some(blob) = parse_pub_key_blob(&s) {
-                    log::trace!("allowing agent key with blob {}", hex::encode(&blob));
-                    blobs.push(blob);
-                    break;
-                }
+        let path = Path::new(&entry.path);
+        match derive_public_blob(path) {
+            Ok(Some(blob)) => {
+                log::trace!("allowing agent key with blob {}", hex::encode(&blob));
+                blobs.push(blob);
+            }
+            Ok(None) => {
+                log::debug!(
+                    "IdentityFile {:?} has no readable public or private key material",
+                    entry.path
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    "failed to derive public key from IdentityFile {:?}: {:#}",
+                    entry.path,
+                    err
+                );
             }
         }
     }
@@ -451,46 +458,6 @@ mod tests {
 
     fn cleanup(dir: &std::path::Path) {
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn parse_rsa_pub_key() {
-        // Minimal valid OpenSSH public key (algo + base64 blob + comment)
-        let content = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAA wez@term";
-        let blob = parse_pub_key_blob(content).expect("should parse valid pub key");
-        assert_eq!(
-            blob,
-            base64::engine::general_purpose::STANDARD
-                .decode("AAAAB3NzaC1yc2EAAAADAQABAAAA")
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn parse_pub_key_no_comment() {
-        let content = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIQ==";
-        let blob = parse_pub_key_blob(content).expect("should parse key without comment");
-        assert_eq!(
-            blob,
-            base64::engine::general_purpose::STANDARD
-                .decode("AAAAC3NzaC1lZDI1NTE5AAAAIQ==")
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn parse_pub_key_empty_string() {
-        assert!(parse_pub_key_blob("").is_none());
-    }
-
-    #[test]
-    fn parse_pub_key_only_algo() {
-        assert!(parse_pub_key_blob("ssh-rsa").is_none());
-    }
-
-    #[test]
-    fn parse_pub_key_invalid_base64() {
-        assert!(parse_pub_key_blob("ssh-rsa !!!not-base64!!!").is_none());
     }
 
     fn entries_from(paths: &[&str]) -> Vec<IdentityFileEntry> {

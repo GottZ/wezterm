@@ -8,6 +8,7 @@ mod dirwrap;
 mod filewrap;
 mod host;
 mod pty;
+mod pubkey_from_private;
 mod session;
 mod sessioninner;
 mod sessionwrap;
