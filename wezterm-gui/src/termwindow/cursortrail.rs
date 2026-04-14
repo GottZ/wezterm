@@ -289,6 +289,27 @@ impl CursorTrailState {
         false
     }
 
+    /// Called when the cursor is hidden (`CursorVisibility::Hidden`).
+    ///
+    /// Silently tracks the new cursor position without spawning any effects and
+    /// clears all in-flight animation state (particles, highlight, smear corners,
+    /// pending jump) so that nothing is rendered while the cursor is invisible.
+    ///
+    /// `prev_initialized` is reset to `false` so that when the cursor becomes
+    /// visible again it snaps immediately to its position rather than triggering
+    /// a smear from the last known location.  This is O(1) — far cheaper than a
+    /// full `update()` call.
+    pub fn advance_hidden(&mut self, current: &StableCursorPosition) {
+        self.prev_pos = *current;
+        self.prev_initialized = false;
+        self.particles.clear();
+        self.highlight = None;
+        self.pending_jump = None;
+        for corner in self.smear_corners.iter_mut() {
+            corner.initialized = false;
+        }
+    }
+
     /// Called once per frame from `paint_pane`.
     ///
     /// - Ticks existing particles / highlight forward by `dt`.

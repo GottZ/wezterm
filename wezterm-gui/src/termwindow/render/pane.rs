@@ -18,6 +18,7 @@ use ordered_float::NotNan;
 use std::time::Instant;
 use wezterm_dynamic::Value;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
+use termwiz::surface::CursorVisibility;
 use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
 
@@ -607,37 +608,61 @@ impl crate::TermWindow {
                 || config.cursor_animation_length > 0.0)
         {
             let now = Instant::now();
+            let cursor_visible = cursor.visibility == CursorVisibility::Visible;
 
             {
                 let cell_width = self.render_metrics.cell_size.width as f32;
                 let cell_height = self.render_metrics.cell_size.height as f32;
                 let mut trails = self.cursor_trail_states.borrow_mut();
                 let trail = trails.entry(pane_id).or_insert_with(CursorTrailState::new);
-                trail.update(
-                    &cursor,
-                    cell_width,
-                    cell_height,
-                    config.cursor_trail_min_distance,
-                    config.cursor_trail_style,
-                    config.cursor_vfx_particle_density,
-                    config.cursor_vfx_particle_lifetime,
-                    config.cursor_vfx_particle_speed,
-                    config.cursor_smear,
-                    config.cursor_animation_length,
-                    config.cursor_trail_size,
-                    config.default_cursor_style.effective_shape(cursor.shape),
-                    now,
-                );
+                if cursor_visible {
+                    trail.update(
+                        &cursor,
+                        cell_width,
+                        cell_height,
+                        config.cursor_trail_min_distance,
+                        config.cursor_trail_style,
+                        config.cursor_vfx_particle_density,
+                        config.cursor_vfx_particle_lifetime,
+                        config.cursor_vfx_particle_speed,
+                        config.cursor_smear,
+                        config.cursor_animation_length,
+                        config.cursor_trail_size,
+                        config.default_cursor_style.effective_shape(cursor.shape),
+                        now,
+                    );
+                } else {
+                    // Cursor hidden (e.g. paru, btop output phase): skip all
+                    // animation work so no trail or smear is painted. Position
+                    // is tracked silently so no jump-smear fires on reappear.
+                    trail.advance_hidden(&cursor);
+                }
             }
 
-            let trail_states = self.cursor_trail_states.borrow();
-            let trail_state = match trail_states.get(&pane_id) {
-                Some(s) => s,
-                None => return Ok(()),
-            };
+            if cursor_visible {
+                let trail_states = self.cursor_trail_states.borrow();
+                let trail_state = match trail_states.get(&pane_id) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
 
-            if config.cursor_trail_style.is_some() {
-                self.paint_cursor_trail(
+                if config.cursor_trail_style.is_some() {
+                    self.paint_cursor_trail(
+                        layers,
+                        pos,
+                        &cursor,
+                        &dims,
+                        current_viewport,
+                        top_pixel_y,
+                        padding_left,
+                        border.clone(),
+                        &palette,
+                        trail_state,
+                        now,
+                    )?;
+                }
+
+                self.paint_animated_cursor(
                     layers,
                     pos,
                     &cursor,
@@ -645,26 +670,12 @@ impl crate::TermWindow {
                     current_viewport,
                     top_pixel_y,
                     padding_left,
-                    border.clone(),
+                    border,
                     &palette,
                     trail_state,
                     now,
                 )?;
             }
-
-            self.paint_animated_cursor(
-                layers,
-                pos,
-                &cursor,
-                &dims,
-                current_viewport,
-                top_pixel_y,
-                padding_left,
-                border,
-                &palette,
-                trail_state,
-                now,
-            )?;
         }
 
         /*
