@@ -23,6 +23,30 @@
 
 use std::path::Path;
 
+/// Hard ceiling for identity-file reads. Realistic OpenSSH keys
+/// stay well below 20 KiB; any file beyond 1 MiB is either a user
+/// typo (`IdentityFile` pointing at `/var/log/syslog`), a pathological
+/// setup, or a pseudo-file like `/dev/zero` that would otherwise
+/// stream unbounded data into our buffer. The read is performed
+/// via `Read::take`, so character devices and FIFOs work as long as
+/// their stream stays inside this budget.
+const MAX_IDENTITY_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Read a file into memory with a hard upper bound of
+/// [`MAX_IDENTITY_FILE_BYTES`]. Returns `None` if the file cannot be
+/// opened; returns the (possibly truncated) prefix otherwise. A
+/// truncated prefix is guaranteed to fail downstream parsing rather
+/// than silently accept a partially-read key.
+fn read_identity_file_capped(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    file.take(MAX_IDENTITY_FILE_BYTES)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(buf)
+}
+
 /// Error type returned by [`derive_public_blob`].
 #[derive(Debug, thiserror::Error)]
 pub enum DerivePubkeyError {
@@ -54,7 +78,9 @@ pub fn derive_public_blob(path: &Path) -> Result<Option<Vec<u8>>, DerivePubkeyEr
     // Read `path` once so strategies 1 and 3 can share the same
     // bytes. Strategies are tried in OpenSSH's `sshkey_load_public`
     // order: path-as-pub, then sibling `.pub`, then private envelope.
-    let path_bytes = std::fs::read(path).ok();
+    // The read is size-capped to avoid user-typo induced memory
+    // blow-ups (e.g. `IdentityFile /var/log/syslog` or `/dev/zero`).
+    let path_bytes = read_identity_file_capped(path);
 
     // Strategy 1: `path` itself is a `.pub`-style public key file
     // (the user pointed `IdentityFile` directly at one).
@@ -130,7 +156,7 @@ fn try_sibling_pub(path: &Path) -> Option<(Vec<u8>, std::path::PathBuf)> {
         Some(name) => path.with_file_name(format!("{}.pub", name.to_string_lossy())),
         None => return None,
     };
-    let bytes = std::fs::read(&pub_path).ok()?;
+    let bytes = read_identity_file_capped(&pub_path)?;
     parse_openssh_public_line(&bytes).map(|blob| (blob, pub_path))
 }
 
@@ -360,5 +386,47 @@ mod tests {
     #[test]
     fn parse_openssh_public_line_rejects_invalid_base64() {
         assert!(parse_openssh_public_line(b"ssh-rsa !!!not-base64!!!").is_none());
+    }
+
+    #[test]
+    fn read_identity_file_capped_enforces_upper_bound() {
+        // Write a file that exceeds MAX_IDENTITY_FILE_BYTES by a
+        // comfortable margin, then confirm that the helper stops
+        // reading at the cap rather than slurping the whole thing.
+        // This is the protection against user-typo IdentityFile
+        // values pointing at `/var/log/syslog` or `/dev/zero`.
+        let dir = TempKeyDir::new("size-cap");
+        let path = dir.join("oversize");
+        let oversize_len = (MAX_IDENTITY_FILE_BYTES as usize) + 4096;
+        std::fs::write(&path, vec![b'A'; oversize_len]).expect("write oversize");
+
+        let bytes = read_identity_file_capped(&path).expect("open ok");
+        assert_eq!(
+            bytes.len() as u64,
+            MAX_IDENTITY_FILE_BYTES,
+            "helper must truncate at the cap"
+        );
+    }
+
+    #[test]
+    fn oversize_file_does_not_ooming_derive() {
+        // End-to-end: point derive_public_blob at a multi-megabyte
+        // garbage file and verify we (a) don't hang or allocate the
+        // whole thing, and (b) surface a clean parse error instead
+        // of a crash.
+        let dir = TempKeyDir::new("oversize-derive");
+        let path = dir.join("garbage_key");
+        let oversize_len = (MAX_IDENTITY_FILE_BYTES as usize) + 1024;
+        std::fs::write(&path, vec![b'Z'; oversize_len]).expect("write oversize");
+
+        match derive_public_blob(&path) {
+            Ok(Some(_)) => panic!("oversize garbage should not decode to a blob"),
+            Ok(None) => panic!("oversize file exists so we should try to parse it"),
+            Err(DerivePubkeyError::Parse { .. }) => {
+                // expected: the truncated prefix is not a valid
+                // OpenSSH private key envelope
+            }
+            Err(other) => panic!("unexpected error variant: {:?}", other),
+        }
     }
 }
