@@ -189,13 +189,28 @@ impl From<ConfigMap> for HostOptions {
     ///
     /// This exists so that older callers that constructed a
     /// `ConfigMap` by hand still compile against the newer
-    /// `Session::connect` API. The conversion recovers the typed
-    /// `identity_files` list by splitting the legacy `identityfile`
-    /// value on whitespace, which **cannot** faithfully represent
-    /// paths containing spaces — the very problem the typed list was
-    /// introduced to fix. For correct handling of quoted or
-    /// backslash-escaped paths use [`Config::resolve_host`] instead.
+    /// [`crate::Session::connect`] API. The conversion recovers the
+    /// typed `identity_files` list by splitting the legacy
+    /// `identityfile` value on whitespace, which **cannot**
+    /// faithfully represent paths containing spaces — the very
+    /// problem the typed list was introduced to fix.
+    ///
+    /// **Prefer [`Config::resolve_host`] for new code.** It runs
+    /// the full OpenSSH `argv_split`-style tokeniser and produces
+    /// a tokeniser-correct `identity_files` list even for paths
+    /// containing whitespace. This impl logs a single
+    /// `log::warn!` per process when it runs to help operators
+    /// notice that they are on the lossy compat route.
     fn from(options: ConfigMap) -> Self {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            log::warn!(
+                "HostOptions::from(ConfigMap) is a lossy compat path for \
+                 IdentityFile entries that contain spaces; prefer \
+                 Config::resolve_host() for tokeniser-correct parsing."
+            );
+        });
+
         let identity_files = options
             .get("identityfile")
             .map(|value| {
@@ -885,14 +900,25 @@ impl Config {
         }
     }
 
-    /// Resolve the configuration for a given host.
-    /// The returned map will expand environment and tokens for options
-    /// where that is specified.
-    /// Note that in some configurations, the config should be parsed once
-    /// to resolve the main configuration, and then based on some options
-    /// (such as CanonicalHostname), the tokens should be updated and
-    /// the config parsed a second time in order for value expansion
-    /// to have the same results as `ssh`.
+    /// Resolve the configuration for a given host as a flat
+    /// [`ConfigMap`].
+    ///
+    /// The returned map will expand environment and tokens for
+    /// options where that is specified. Note that in some
+    /// configurations, the config should be parsed once to
+    /// resolve the main configuration, and then based on some
+    /// options (such as `CanonicalHostname`), the tokens should
+    /// be updated and the config parsed a second time in order
+    /// for value expansion to have the same results as `ssh`.
+    ///
+    /// **For `IdentityFile` entries containing spaces**, prefer
+    /// [`Config::resolve_host`] — the flat `ConfigMap` joins
+    /// multiple IdentityFile directives with a single space
+    /// separator, which cannot be round-tripped unambiguously
+    /// when any of the paths themselves contain whitespace.
+    /// `resolve_host` returns a typed list that survives this
+    /// round-trip and is the recommended input for
+    /// [`crate::Session::connect`].
     pub fn for_host<H: AsRef<str>>(&self, host: H) -> ConfigMap {
         let host = host.as_ref();
         let local_user = self.resolve_local_user();
@@ -2615,7 +2641,6 @@ Some(
             "/a/b /c/d with space".to_string(),
         );
 
-        #[allow(deprecated)]
         let host_options: HostOptions = map.into();
 
         let paths: Vec<String> = host_options
