@@ -335,10 +335,22 @@ mod tests {
     /// exercise the real OpenSSH private key format end-to-end.
     /// Returns `None` if `ssh-keygen` is not on PATH so the test
     /// can skip cleanly on minimal CI images.
-    fn keygen(dir: &Path, key_type: &str, passphrase: Option<&str>) -> Option<std::path::PathBuf> {
-        let path = dir.join(format!("id_{}", key_type));
-        let status = Command::new("ssh-keygen")
-            .arg("-t")
+    ///
+    /// `bits` is optional and maps to `-b <bits>`; it is required for
+    /// RSA/ECDSA variants where we want to pin the parameter size.
+    fn keygen(
+        dir: &Path,
+        key_type: &str,
+        passphrase: Option<&str>,
+        bits: Option<u32>,
+    ) -> Option<std::path::PathBuf> {
+        let file_name = match bits {
+            Some(b) => format!("id_{}_{}", key_type, b),
+            None => format!("id_{}", key_type),
+        };
+        let path = dir.join(&file_name);
+        let mut cmd = Command::new("ssh-keygen");
+        cmd.arg("-t")
             .arg(key_type)
             .arg("-f")
             .arg(&path)
@@ -346,9 +358,11 @@ mod tests {
             .arg("test@wezterm")
             .arg("-q")
             .arg("-N")
-            .arg(passphrase.unwrap_or(""))
-            .status()
-            .ok()?;
+            .arg(passphrase.unwrap_or(""));
+        if let Some(b) = bits {
+            cmd.arg("-b").arg(b.to_string());
+        }
+        let status = cmd.status().ok()?;
         if !status.success() {
             return None;
         }
@@ -371,7 +385,7 @@ mod tests {
         // `id_ed25519.pub` side by side. Strategy 2 finds the
         // sibling .pub first.
         let dir = TempKeyDir::new("ed25519-sibling");
-        let Some(private) = keygen(&dir.path, "ed25519", None) else {
+        let Some(private) = keygen(&dir.path, "ed25519", None, None) else {
             return;
         };
         let blob = derive(&private);
@@ -384,7 +398,7 @@ mod tests {
         // file gone, the blob must still be obtainable from the
         // unencrypted envelope of the private key.
         let dir = TempKeyDir::new("ed25519-envelope");
-        let Some(private) = keygen(&dir.path, "ed25519", None) else {
+        let Some(private) = keygen(&dir.path, "ed25519", None, None) else {
             return;
         };
         std::fs::remove_file(dir.join("id_ed25519.pub")).expect("remove sibling");
@@ -401,8 +415,12 @@ mod tests {
         // hardware-backed setups without prompting for a
         // passphrase.
         let dir = TempKeyDir::new("ed25519-passphrase");
-        let Some(private) = keygen(&dir.path, "ed25519", Some("correct horse battery staple"))
-        else {
+        let Some(private) = keygen(
+            &dir.path,
+            "ed25519",
+            Some("correct horse battery staple"),
+            None,
+        ) else {
             return;
         };
         std::fs::remove_file(dir.join("id_ed25519.pub")).expect("remove sibling");
@@ -416,7 +434,7 @@ mod tests {
         // byte-for-byte the same blob; anything else means we
         // have a correctness gap between the two strategies.
         let dir = TempKeyDir::new("ed25519-consistency");
-        let Some(private) = keygen(&dir.path, "ed25519", None) else {
+        let Some(private) = keygen(&dir.path, "ed25519", None, None) else {
             return;
         };
 
@@ -437,7 +455,7 @@ mod tests {
         // envelope, so the extraction path should behave
         // identically to ed25519.
         let dir = TempKeyDir::new("ecdsa-envelope");
-        let Some(private) = keygen(&dir.path, "ecdsa", None) else {
+        let Some(private) = keygen(&dir.path, "ecdsa", None, None) else {
             return;
         };
         let sibling = dir.join("id_ecdsa.pub");
@@ -454,7 +472,7 @@ mod tests {
         // directly. Strategy 1 handles that without touching any
         // siblings.
         let dir = TempKeyDir::new("direct-pub");
-        let Some(private) = keygen(&dir.path, "ed25519", None) else {
+        let Some(private) = keygen(&dir.path, "ed25519", None, None) else {
             return;
         };
         let pub_path = dir.join("id_ed25519.pub");
@@ -555,5 +573,204 @@ mod tests {
             }
             Err(other) => panic!("unexpected error variant: {:?}", other),
         }
+    }
+
+    #[test]
+    fn ecdsa_p384_strategy_3_envelope_roundtrip() {
+        // ECDSA-384 uses the `ecdsa-sha2-nistp384` wire name. The
+        // envelope parser is algorithm-agnostic, so the sibling and
+        // envelope paths must agree byte-for-byte.
+        let dir = TempKeyDir::new("ecdsa384-envelope");
+        let Some(private) = keygen(&dir.path, "ecdsa", None, Some(384)) else {
+            return;
+        };
+        let from_sibling = derive(&private);
+        let sibling = dir.join("id_ecdsa_384.pub");
+        std::fs::remove_file(&sibling).expect("remove sibling");
+        let from_envelope = derive(&private);
+        assert_eq!(from_sibling, from_envelope);
+    }
+
+    #[test]
+    fn ecdsa_p521_strategy_3_envelope_roundtrip() {
+        // ECDSA-521 is the largest NIST curve OpenSSH supports;
+        // ensure the envelope walker handles its ~140-byte public
+        // blob cleanly.
+        let dir = TempKeyDir::new("ecdsa521-envelope");
+        let Some(private) = keygen(&dir.path, "ecdsa", None, Some(521)) else {
+            return;
+        };
+        let from_sibling = derive(&private);
+        let sibling = dir.join("id_ecdsa_521.pub");
+        std::fs::remove_file(&sibling).expect("remove sibling");
+        let from_envelope = derive(&private);
+        assert_eq!(from_sibling, from_envelope);
+    }
+
+    #[test]
+    fn rsa2048_strategy_3_envelope_roundtrip() {
+        // RSA-2048 is the legacy floor still in the wild; the
+        // envelope parser must handle its ~280-byte public blob.
+        let dir = TempKeyDir::new("rsa2048-envelope");
+        let Some(private) = keygen(&dir.path, "rsa", None, Some(2048)) else {
+            return;
+        };
+        let from_sibling = derive(&private);
+        let sibling = dir.join("id_rsa_2048.pub");
+        std::fs::remove_file(&sibling).expect("remove sibling");
+        let from_envelope = derive(&private);
+        assert_eq!(from_sibling, from_envelope);
+    }
+
+    #[test]
+    fn rsa3072_strategy_3_envelope_roundtrip() {
+        // RSA-3072 is OpenSSH's current default for `ssh-keygen -t rsa`
+        // and therefore the most common variant we will encounter in
+        // the field.
+        let dir = TempKeyDir::new("rsa3072-envelope");
+        let Some(private) = keygen(&dir.path, "rsa", None, Some(3072)) else {
+            return;
+        };
+        let from_sibling = derive(&private);
+        let sibling = dir.join("id_rsa_3072.pub");
+        std::fs::remove_file(&sibling).expect("remove sibling");
+        let from_envelope = derive(&private);
+        assert_eq!(from_sibling, from_envelope);
+    }
+
+    #[test]
+    fn rsa4096_strategy_3_envelope_roundtrip() {
+        // RSA-4096 is the upper end of what operators routinely
+        // generate; its ~540-byte public blob should still fit well
+        // below the 32 KiB MAX_PUBKEY cap.
+        let dir = TempKeyDir::new("rsa4096-envelope");
+        let Some(private) = keygen(&dir.path, "rsa", None, Some(4096)) else {
+            return;
+        };
+        let from_sibling = derive(&private);
+        let sibling = dir.join("id_rsa_4096.pub");
+        std::fs::remove_file(&sibling).expect("remove sibling");
+        let from_envelope = derive(&private);
+        assert_eq!(from_sibling, from_envelope);
+    }
+
+    #[test]
+    fn rsa2048_strategy_3_survives_passphrase_protection() {
+        // Mirror of the ed25519 passphrase test for RSA-2048: a
+        // passphrase-protected RSA key must still yield its public
+        // blob from the envelope header without prompting, so the
+        // agent-key filter works for hardware-backed RSA setups.
+        let dir = TempKeyDir::new("rsa2048-passphrase");
+        let Some(private) = keygen(
+            &dir.path,
+            "rsa",
+            Some("correct horse battery staple"),
+            Some(2048),
+        ) else {
+            return;
+        };
+        std::fs::remove_file(dir.join("id_rsa_2048.pub")).expect("remove sibling");
+        let blob = derive(&private);
+        assert!(!blob.is_empty());
+    }
+
+    #[test]
+    fn envelope_rejects_bad_magic() {
+        // Hand-craft a PEM envelope whose base64 body decodes cleanly
+        // but does not start with `openssh-key-v1\0`. The parser must
+        // reject with `Parse { source: InvalidMagic }`.
+        use base64::Engine;
+        let dir = TempKeyDir::new("bad-magic");
+        let path = dir.join("bad_magic");
+
+        // 15 bytes of bogus magic where the real magic should be.
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(b"wrong magic \0\0\0");
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&body);
+        let pem = format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+            b64
+        );
+        std::fs::write(&path, pem.as_bytes()).expect("write");
+
+        let err = derive_public_blob(&path).expect_err("bad magic must error");
+        assert!(
+            matches!(
+                err,
+                DerivePubkeyError::Parse {
+                    source: EnvelopeParseError::InvalidMagic,
+                    ..
+                }
+            ),
+            "expected Parse(InvalidMagic), got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_truncated_header() {
+        // Generate a real ed25519 key, then truncate the on-disk
+        // bytes in half. The parser must surface a Parse error
+        // rather than panic or return a bogus blob.
+        let dir = TempKeyDir::new("truncated");
+        let Some(private) = keygen(&dir.path, "ed25519", None, None) else {
+            return;
+        };
+        let full = std::fs::read(&private).expect("read full key");
+        std::fs::write(&private, &full[..full.len() / 2]).expect("truncate");
+        std::fs::remove_file(dir.join("id_ed25519.pub")).expect("remove sibling");
+
+        let err = derive_public_blob(&private).expect_err("truncated key must error");
+        assert!(
+            matches!(err, DerivePubkeyError::Parse { .. }),
+            "expected Parse error, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_unsupported_key_count() {
+        // Hand-craft a valid envelope prefix whose `num_keys` field
+        // is 2. OpenSSH itself always writes 1 here; anything else
+        // is malformed and must be rejected with
+        // `UnsupportedKeyCount`.
+        use base64::Engine;
+        let dir = TempKeyDir::new("bad-key-count");
+        let path = dir.join("bad_key_count");
+
+        let mut body: Vec<u8> = Vec::new();
+        // magic
+        body.extend_from_slice(b"openssh-key-v1\0");
+        // ciphername = "none"
+        body.extend_from_slice(&0x00000004u32.to_be_bytes());
+        body.extend_from_slice(b"none");
+        // kdfname = "none"
+        body.extend_from_slice(&0x00000004u32.to_be_bytes());
+        body.extend_from_slice(b"none");
+        // kdfoptions = ""
+        body.extend_from_slice(&0x00000000u32.to_be_bytes());
+        // num_keys = 2 (the invalid value)
+        body.extend_from_slice(&0x00000002u32.to_be_bytes());
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&body);
+        let pem = format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+            b64
+        );
+        std::fs::write(&path, pem.as_bytes()).expect("write");
+
+        let err = derive_public_blob(&path).expect_err("bad num_keys must error");
+        assert!(
+            matches!(
+                err,
+                DerivePubkeyError::Parse {
+                    source: EnvelopeParseError::UnsupportedKeyCount(2),
+                    ..
+                }
+            ),
+            "expected Parse(UnsupportedKeyCount(2)), got {:?}",
+            err
+        );
     }
 }
