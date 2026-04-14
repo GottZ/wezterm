@@ -2559,4 +2559,192 @@ Some(
         assert_eq!(host_options.identity_files.len(), 1);
         assert_eq!(host_options.identity_files[0].path, "/new");
     }
+
+    // ---------------------------------------------------------------
+    // H11: direct unit tests closing the coverage gaps surfaced by
+    // the 24-agent review. These exercise paths that were previously
+    // only reached indirectly (or not at all) by the existing
+    // suite.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn resolve_host_returns_options_and_identity_files_consistently() {
+        // The main public entry point `resolve_host` should produce
+        // a `HostOptions` whose flat `ConfigMap` and typed
+        // `identity_files` list agree for a straightforward parsed
+        // config. Previously only indirectly covered via
+        // `resolve_identity_files` tests.
+        let mut config = Config::new();
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        config.assign_environment(fake_env);
+        config.add_config_string(
+            r#"
+            Host foo
+                User someone
+                IdentityFile /home/me/.ssh/custom_key
+            "#,
+        );
+
+        let resolved = config.resolve_host("foo");
+
+        assert_eq!(
+            resolved.options.get("user").cloned(),
+            Some("someone".to_string())
+        );
+        assert_eq!(
+            resolved.options.get("hostname").cloned(),
+            Some("foo".to_string())
+        );
+        assert_eq!(resolved.identity_files.len(), 1);
+        assert_eq!(resolved.identity_files[0].path, "/home/me/.ssh/custom_key");
+    }
+
+    #[test]
+    fn from_configmap_splits_identityfile_on_whitespace_silently() {
+        // Compat conversion pins: legacy `From<ConfigMap>` splits
+        // the `identityfile` value on whitespace, which cannot
+        // represent paths containing spaces. This test documents
+        // the known-lossy round-trip and serves as a deprecation
+        // signal for callers who land on this route instead of the
+        // correct `Config::resolve_host` entry point.
+        let mut map = ConfigMap::new();
+        map.insert(
+            "identityfile".to_string(),
+            "/a/b /c/d with space".to_string(),
+        );
+
+        #[allow(deprecated)]
+        let host_options: HostOptions = map.into();
+
+        let paths: Vec<String> = host_options
+            .identity_files
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+
+        // The intended single path `/c/d with space` has been
+        // shredded into three separate bogus entries. This is the
+        // whole reason the typed list was introduced; callers who
+        // need correctness should use `Config::resolve_host`.
+        assert_eq!(
+            paths,
+            vec![
+                "/a/b".to_string(),
+                "/c/d".to_string(),
+                "with".to_string(),
+                "space".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn match_all_applies_identityfile_to_any_host() {
+        // `Match all` is supposed to match every hostname. The
+        // criterion was never exercised by the test suite before.
+        let mut config = Config::new();
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        config.assign_environment(fake_env);
+        config.add_config_string(
+            r#"
+            Match all
+                IdentityFile /home/me/.ssh/universal_key
+            "#,
+        );
+
+        let paths: Vec<String> = config
+            .resolve_identity_files("any_host_at_all")
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(paths, vec!["/home/me/.ssh/universal_key".to_string()]);
+    }
+
+    #[test]
+    fn match_originalhost_applies_on_host_pattern() {
+        // `Match originalhost` shares the hostname-matching path
+        // in `is_match`. The test pins the current behaviour.
+        let mut config = Config::new();
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        config.assign_environment(fake_env);
+        config.add_config_string(
+            r#"
+            Match originalhost bar
+                IdentityFile /home/me/.ssh/bar_key
+            "#,
+        );
+
+        let matching: Vec<String> = config
+            .resolve_identity_files("bar")
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(matching, vec!["/home/me/.ssh/bar_key".to_string()]);
+
+        let non_matching: Vec<String> = config
+            .resolve_identity_files("quux")
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        // A non-matching host falls back to the OpenSSH defaults.
+        assert!(!non_matching.contains(&"/home/me/.ssh/bar_key".to_string()));
+    }
+
+    #[test]
+    fn match_localuser_applies_on_local_user_pattern() {
+        // `Match localuser` matches against the environment USER
+        // (fake_env provides it). The criterion was previously
+        // untested.
+        let mut config = Config::new();
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        config.assign_environment(fake_env);
+        config.add_config_string(
+            r#"
+            Match localuser me
+                IdentityFile /home/me/.ssh/me_key
+            "#,
+        );
+
+        let paths: Vec<String> = config
+            .resolve_identity_files("irrelevant_host")
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(paths, vec!["/home/me/.ssh/me_key".to_string()]);
+    }
+
+    #[test]
+    fn resolve_identity_files_expands_env_var_in_path() {
+        // `${VAR}` expansion inside an IdentityFile path goes
+        // through the new `expand_identity_path` helper (which in
+        // turn delegates to `expand_environment`). Previously only
+        // IdentityAgent tests touched the environment expansion
+        // path; IdentityFile needed its own guard.
+        let mut config = Config::new();
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        fake_env.insert("SSH_KEY_DIR".to_string(), "/custom/keys".to_string());
+        config.assign_environment(fake_env);
+        config.add_config_string(
+            r#"
+            Host foo
+                IdentityFile ${SSH_KEY_DIR}/id_ed25519
+            "#,
+        );
+
+        let paths: Vec<String> = config
+            .resolve_identity_files("foo")
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(paths, vec!["/custom/keys/id_ed25519".to_string()]);
+    }
 }
