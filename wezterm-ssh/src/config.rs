@@ -118,6 +118,73 @@ impl IdentityFileEntry {
     }
 }
 
+/// The resolved ssh_config options for a given host.
+///
+/// `HostOptions` is the preferred input shape for
+/// [`crate::Session::connect`]: it bundles the flat `ConfigMap` that
+/// covers every single-value directive with a typed list of
+/// `IdentityFile` entries that preserves declaration order and
+/// tolerates paths containing whitespace — two things the flat
+/// `ConfigMap` representation cannot round-trip cleanly.
+///
+/// Construct a `HostOptions` with [`Config::resolve_host`] for the
+/// common case of resolving an ssh_config tree against a hostname.
+/// A `From<ConfigMap>` impl is also provided so that legacy callers
+/// that already own a flat map can keep working; that conversion
+/// falls back to splitting the legacy `identityfile` string on
+/// whitespace, which means it cannot faithfully represent paths that
+/// contain spaces — new code should go through `resolve_host`
+/// whenever possible.
+///
+/// ```no_run
+/// use wezterm_ssh::{Config, Session};
+///
+/// let mut config = Config::new();
+/// config.add_default_config_files();
+/// let host_options = config.resolve_host("example.com");
+/// let (_session, _events) = Session::connect(host_options)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostOptions {
+    /// Flat key-value options as produced by [`Config::for_host`].
+    pub options: ConfigMap,
+    /// `IdentityFile` entries in OpenSSH declaration order (file
+    /// global first, then matching stanzas), with the built-in
+    /// defaults applied when no directive matched.
+    pub identity_files: Vec<IdentityFileEntry>,
+}
+
+impl From<ConfigMap> for HostOptions {
+    /// Build a [`HostOptions`] from a legacy flat `ConfigMap`.
+    ///
+    /// This exists so that older callers that constructed a
+    /// `ConfigMap` by hand still compile against the newer
+    /// `Session::connect` API. The conversion recovers the typed
+    /// `identity_files` list by splitting the legacy `identityfile`
+    /// value on whitespace, which **cannot** faithfully represent
+    /// paths containing spaces — the very problem the typed list was
+    /// introduced to fix. For correct handling of quoted or
+    /// backslash-escaped paths use [`Config::resolve_host`] instead.
+    fn from(options: ConfigMap) -> Self {
+        let identity_files = options
+            .get("identityfile")
+            .map(|value| {
+                value
+                    .split_whitespace()
+                    .map(|path| IdentityFileEntry {
+                        path: path.to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            options,
+            identity_files,
+        }
+    }
+}
+
 /// Represents `Host pattern,list` stanza in the config,
 /// and the options that it logically contains
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -676,6 +743,18 @@ impl Config {
         }
 
         entries
+    }
+
+    /// Resolve both the flat ConfigMap and the typed IdentityFile
+    /// list for the given host in a single call. This is the
+    /// recommended entry point for [`crate::Session::connect`] so
+    /// that consumers see a consistent view of both representations.
+    pub fn resolve_host<H: AsRef<str>>(&self, host: H) -> HostOptions {
+        let host = host.as_ref();
+        HostOptions {
+            options: self.for_host(host),
+            identity_files: self.resolve_identity_files(host),
+        }
     }
 
     /// Resolve the configuration for a given host.

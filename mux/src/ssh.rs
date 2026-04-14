@@ -23,7 +23,7 @@ use termwiz::render::terminfo::TerminfoRenderer;
 use termwiz::surface::{Change, LineAttribute};
 use termwiz::terminal::{ScreenSize, Terminal, TerminalWaker};
 use wezterm_ssh::{
-    ConfigMap, HostVerificationFailed, Session, SessionEvent, SshChildProcess, SshPty,
+    HostOptions, HostVerificationFailed, Session, SessionEvent, SshChildProcess, SshPty,
 };
 use wezterm_term::TerminalSize;
 
@@ -58,16 +58,17 @@ impl LineEditorHost for PasswordPromptHost {
 }
 
 pub fn ssh_connect_with_ui(
-    ssh_config: wezterm_ssh::ConfigMap,
+    host_options: HostOptions,
     ui: &mut ConnectionUI,
 ) -> anyhow::Result<Session> {
     let cloned_ui = ui.clone();
     cloned_ui.run_and_log_error(move || {
-        let remote_address = ssh_config
+        let remote_address = host_options
+            .options
             .get("hostname")
             .expect("ssh config to always set hostname");
         ui.output_str(&format!("Connecting to {} using SSH\n", remote_address));
-        let (session, events) = Session::connect(ssh_config.clone())?;
+        let (session, events) = Session::connect(host_options.clone())?;
 
         while let Ok(event) = smol::block_on(events.recv()) {
             match event {
@@ -184,7 +185,7 @@ pub struct RemoteSshDomain {
     name: String,
 }
 
-pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap> {
+pub fn ssh_domain_to_host_options(ssh_dom: &SshDomain) -> anyhow::Result<HostOptions> {
     let mut ssh_config = wezterm_ssh::Config::new();
     ssh_config.add_default_config_files();
 
@@ -198,8 +199,8 @@ pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap
         }
     };
 
-    let mut ssh_config = ssh_config.for_host(&remote_host_name);
-    ssh_config.insert(
+    let mut host_options = ssh_config.resolve_host(&remote_host_name);
+    host_options.options.insert(
         "wezterm_ssh_backend".to_string(),
         match ssh_dom
             .ssh_backend
@@ -211,22 +212,42 @@ pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap
         .to_string(),
     );
     for (k, v) in &ssh_dom.ssh_option {
-        ssh_config.insert(k.to_string(), v.to_string());
+        // IdentityFile overrides coming in via `-o` on the command
+        // line are accumulated into the typed list so that repeated
+        // `-o IdentityFile=...` flags stack (wave 6 fix for the CLI
+        // clobber bug in wezterm-gui/src/main.rs).
+        if k.eq_ignore_ascii_case("identityfile") {
+            host_options
+                .identity_files
+                .push(wezterm_ssh::IdentityFileEntry { path: v.clone() });
+            continue;
+        }
+        host_options.options.insert(k.to_string(), v.to_string());
     }
 
     if let Some(username) = &ssh_dom.username {
-        ssh_config.insert("user".to_string(), username.to_string());
+        host_options
+            .options
+            .insert("user".to_string(), username.to_string());
     }
     if let Some(port) = port {
-        ssh_config.insert("port".to_string(), port.to_string());
+        host_options
+            .options
+            .insert("port".to_string(), port.to_string());
     }
     if ssh_dom.no_agent_auth {
-        ssh_config.insert("identitiesonly".to_string(), "yes".to_string());
+        host_options
+            .options
+            .insert("identitiesonly".to_string(), "yes".to_string());
     }
-    if let Some("true") = ssh_config.get("wezterm_ssh_verbose").map(|s| s.as_str()) {
-        log::info!("Using ssh config: {ssh_config:#?}");
+    if let Some("true") = host_options
+        .options
+        .get("wezterm_ssh_verbose")
+        .map(|s| s.as_str())
+    {
+        log::info!("Using ssh config: {host_options:#?}");
     }
-    Ok(ssh_config)
+    Ok(host_options)
 }
 
 impl RemoteSshDomain {
@@ -240,8 +261,8 @@ impl RemoteSshDomain {
         })
     }
 
-    pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {
-        ssh_domain_to_ssh_config(&self.dom)
+    pub fn host_options(&self) -> anyhow::Result<HostOptions> {
+        ssh_domain_to_host_options(&self.dom)
     }
 
     fn build_command(
@@ -330,7 +351,7 @@ impl RemoteSshDomain {
         env: HashMap<String, String>,
         size: TerminalSize,
     ) -> anyhow::Result<StartNewSessionResult> {
-        let (session, events) = Session::connect(self.ssh_config().context("obtain ssh config")?)
+        let (session, events) = Session::connect(self.host_options().context("obtain ssh config")?)
             .context("connect to ssh server")?;
         self.session.lock().unwrap().replace(session.clone());
 

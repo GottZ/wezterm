@@ -1,3 +1,4 @@
+use crate::config::IdentityFileEntry;
 use crate::session::SessionEvent;
 use anyhow::Context;
 use smol::channel::{bounded, Sender};
@@ -17,14 +18,14 @@ fn parse_pub_key_blob(content: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(b64).ok()
 }
 
-/// Collect allowed public key blobs from the `IdentityFile` entries in the
-/// ssh config. For each entry we check both the path as-is and with a `.pub`
+/// Collect allowed public key blobs from a list of [`IdentityFileEntry`]
+/// values. For each entry we check both the path as-is and with a `.pub`
 /// suffix appended, returning the first successfully parsed blob.
 #[cfg(feature = "ssh2")]
-fn collect_identity_blobs(identity_files: &str) -> Vec<Vec<u8>> {
+fn collect_identity_blobs(identity_files: &[IdentityFileEntry]) -> Vec<Vec<u8>> {
     let mut blobs = Vec::new();
-    for file in identity_files.split_whitespace() {
-        for path in &[file.to_string(), format!("{}.pub", file)] {
+    for entry in identity_files {
+        for path in &[entry.path.clone(), format!("{}.pub", entry.path)] {
             if let Ok(s) = std::fs::read_to_string(path) {
                 if let Some(blob) = parse_pub_key_blob(&s) {
                     log::trace!("allowing agent key with blob {}", hex::encode(&blob));
@@ -41,17 +42,16 @@ fn collect_identity_blobs(identity_files: &str) -> Vec<Vec<u8>> {
 /// Returns `None` when all agent keys are allowed (IdentitiesOnly is not
 /// set or not "yes"), or `Some(blobs)` with the restricted set.
 #[cfg(feature = "ssh2")]
-fn allowed_agent_key_blobs(config: &crate::config::ConfigMap) -> Option<Vec<Vec<u8>>> {
+fn allowed_agent_key_blobs(
+    config: &crate::config::ConfigMap,
+    identity_files: &[IdentityFileEntry],
+) -> Option<Vec<Vec<u8>>> {
     if config
         .get("identitiesonly")
         .map(|s| s.trim().eq_ignore_ascii_case("yes"))
         .unwrap_or(false)
     {
-        let blobs = config
-            .get("identityfile")
-            .map(|files| collect_identity_blobs(files))
-            .unwrap_or_default();
-        Some(blobs)
+        Some(collect_identity_blobs(identity_files))
     } else {
         None
     }
@@ -89,7 +89,7 @@ impl crate::sessioninner::SessionInner {
         let identities = agent.identities()?;
         log::trace!("ssh agent has {} identities", identities.len());
 
-        let allowed = allowed_agent_key_blobs(&self.config);
+        let allowed = allowed_agent_key_blobs(&self.config, &self.identity_files);
 
         let identities: Vec<_> = if let Some(allowed) = &allowed {
             identities
@@ -131,64 +131,65 @@ impl crate::sessioninner::SessionInner {
     ) -> anyhow::Result<bool> {
         use std::path::{Path, PathBuf};
 
-        if let Some(files) = self.config.get("identityfile") {
-            for file in files.split_whitespace() {
-                let pubkey: PathBuf = format!("{}.pub", file).into();
-                let file = Path::new(file);
+        // Clone so we can iterate without holding a borrow on `self`
+        // while `tx_event.try_send` below wants &mut self access.
+        let identity_files = self.identity_files.clone();
+        for entry in &identity_files {
+            let pubkey: PathBuf = format!("{}.pub", entry.path).into();
+            let file = Path::new(&entry.path);
 
-                if !file.exists() {
-                    continue;
+            if !file.exists() {
+                continue;
+            }
+
+            let pubkey = if pubkey.exists() {
+                Some(pubkey.as_ref())
+            } else {
+                None
+            };
+
+            // We try with no passphrase first, in case the key is unencrypted
+            match sess.userauth_pubkey_file(user, pubkey, &file, None) {
+                Ok(_) => {
+                    log::info!("pubkey_file immediately ok for {}", file.display());
+                    return Ok(true);
                 }
+                Err(_) => {
+                    // Most likely cause of error is that we need a passphrase
+                    // to decrypt the key, so let's prompt the user for one.
+                    let (reply, answers) = bounded(1);
+                    self.tx_event
+                        .try_send(SessionEvent::Authenticate(AuthenticationEvent {
+                            username: "".to_string(),
+                            instructions: "".to_string(),
+                            prompts: vec![AuthenticationPrompt {
+                                prompt: format!(
+                                    "Passphrase to decrypt {} for {}@{}:\n> ",
+                                    file.display(),
+                                    user,
+                                    host
+                                ),
+                                echo: false,
+                            }],
+                            reply,
+                        }))
+                        .context("sending Authenticate request to user")?;
 
-                let pubkey = if pubkey.exists() {
-                    Some(pubkey.as_ref())
-                } else {
-                    None
-                };
+                    let answers = smol::block_on(answers.recv())
+                        .context("waiting for authentication answers from user")?;
 
-                // We try with no passphrase first, in case the key is unencrypted
-                match sess.userauth_pubkey_file(user, pubkey, &file, None) {
-                    Ok(_) => {
-                        log::info!("pubkey_file immediately ok for {}", file.display());
-                        return Ok(true);
+                    if answers.is_empty() {
+                        anyhow::bail!("user cancelled authentication");
                     }
-                    Err(_) => {
-                        // Most likely cause of error is that we need a passphrase
-                        // to decrypt the key, so let's prompt the user for one.
-                        let (reply, answers) = bounded(1);
-                        self.tx_event
-                            .try_send(SessionEvent::Authenticate(AuthenticationEvent {
-                                username: "".to_string(),
-                                instructions: "".to_string(),
-                                prompts: vec![AuthenticationPrompt {
-                                    prompt: format!(
-                                        "Passphrase to decrypt {} for {}@{}:\n> ",
-                                        file.display(),
-                                        user,
-                                        host
-                                    ),
-                                    echo: false,
-                                }],
-                                reply,
-                            }))
-                            .context("sending Authenticate request to user")?;
 
-                        let answers = smol::block_on(answers.recv())
-                            .context("waiting for authentication answers from user")?;
+                    let passphrase = &answers[0];
 
-                        if answers.is_empty() {
-                            anyhow::bail!("user cancelled authentication");
+                    match sess.userauth_pubkey_file(user, pubkey, &file, Some(passphrase)) {
+                        Ok(_) => {
+                            return Ok(true);
                         }
-
-                        let passphrase = &answers[0];
-
-                        match sess.userauth_pubkey_file(user, pubkey, &file, Some(passphrase)) {
-                            Ok(_) => {
-                                return Ok(true);
-                            }
-                            Err(err) => {
-                                log::warn!("pubkey auth: {:#}", err);
-                            }
+                        Err(err) => {
+                            log::warn!("pubkey auth: {:#}", err);
                         }
                     }
                 }
@@ -492,6 +493,15 @@ mod tests {
         assert!(parse_pub_key_blob("ssh-rsa !!!not-base64!!!").is_none());
     }
 
+    fn entries_from(paths: &[&str]) -> Vec<IdentityFileEntry> {
+        paths
+            .iter()
+            .map(|p| IdentityFileEntry {
+                path: (*p).to_string(),
+            })
+            .collect()
+    }
+
     #[test]
     fn collect_blobs_from_pub_file() {
         let dir = tmpdir("blobs_pub");
@@ -499,9 +509,9 @@ mod tests {
         std::fs::write(&pub_path, "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAA test\n").unwrap();
 
         let priv_path = dir.join("id_test");
-        let identity_files = priv_path.to_str().unwrap();
+        let entries = entries_from(&[priv_path.to_str().unwrap()]);
 
-        let blobs = collect_identity_blobs(identity_files);
+        let blobs = collect_identity_blobs(&entries);
         assert_eq!(blobs.len(), 1);
         assert_eq!(
             blobs[0],
@@ -520,15 +530,16 @@ mod tests {
         let path = dir.join("id_test.pub");
         std::fs::write(&path, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIQ==\n").unwrap();
 
-        let identity_files = path.to_str().unwrap();
-        let blobs = collect_identity_blobs(identity_files);
+        let entries = entries_from(&[path.to_str().unwrap()]);
+        let blobs = collect_identity_blobs(&entries);
         assert_eq!(blobs.len(), 1);
         cleanup(&dir);
     }
 
     #[test]
     fn collect_blobs_missing_files() {
-        let blobs = collect_identity_blobs("/nonexistent/path/id_key");
+        let entries = entries_from(&["/nonexistent/path/id_key"]);
+        let blobs = collect_identity_blobs(&entries);
         assert!(blobs.is_empty());
     }
 
@@ -542,13 +553,32 @@ mod tests {
         let pub2 = dir.join("key2.pub");
         std::fs::write(&pub2, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIQ== k2\n").unwrap();
 
-        let files = format!(
-            "{} {}",
-            dir.join("key1").to_str().unwrap(),
-            dir.join("key2").to_str().unwrap()
-        );
-        let blobs = collect_identity_blobs(&files);
+        let key1 = dir.join("key1");
+        let key2 = dir.join("key2");
+        let entries = entries_from(&[key1.to_str().unwrap(), key2.to_str().unwrap()]);
+        let blobs = collect_identity_blobs(&entries);
         assert_eq!(blobs.len(), 2);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn collect_blobs_preserves_space_in_path() {
+        // Regression guard for the original motivation of the refactor:
+        // a private key file living in a directory whose name contains
+        // a space must be readable via the typed identity list. The
+        // legacy space-concatenated ConfigMap value cannot represent
+        // this case unambiguously.
+        let dir = tmpdir("blobs_space dir");
+        let pub_path = dir.join("id_test.pub");
+        std::fs::write(
+            &pub_path,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIQ== spaced\n",
+        )
+        .unwrap();
+        let priv_path = dir.join("id_test");
+        let entries = entries_from(&[priv_path.to_str().unwrap()]);
+        let blobs = collect_identity_blobs(&entries);
+        assert_eq!(blobs.len(), 1);
         cleanup(&dir);
     }
 
@@ -556,14 +586,14 @@ mod tests {
     fn identities_only_not_set_allows_all() {
         // No identitiesonly in config → None (all keys allowed)
         let config = crate::config::ConfigMap::new();
-        assert!(allowed_agent_key_blobs(&config).is_none());
+        assert!(allowed_agent_key_blobs(&config, &[]).is_none());
     }
 
     #[test]
     fn identities_only_no_disables_filtering() {
         let mut config = crate::config::ConfigMap::new();
         config.insert("identitiesonly".into(), "no".into());
-        assert!(allowed_agent_key_blobs(&config).is_none());
+        assert!(allowed_agent_key_blobs(&config, &[]).is_none());
     }
 
     #[test]
@@ -574,12 +604,9 @@ mod tests {
 
         let mut config = crate::config::ConfigMap::new();
         config.insert("identitiesonly".into(), "yes".into());
-        config.insert(
-            "identityfile".into(),
-            dir.join("id_test").to_str().unwrap().into(),
-        );
+        let entries = entries_from(&[dir.join("id_test").to_str().unwrap()]);
 
-        let allowed = allowed_agent_key_blobs(&config);
+        let allowed = allowed_agent_key_blobs(&config, &entries);
         assert!(allowed.is_some());
         let blobs = allowed.unwrap();
         assert_eq!(blobs.len(), 1);
@@ -598,7 +625,7 @@ mod tests {
             let mut config = crate::config::ConfigMap::new();
             config.insert("identitiesonly".into(), value.into());
             assert!(
-                allowed_agent_key_blobs(&config).is_some(),
+                allowed_agent_key_blobs(&config, &[]).is_some(),
                 "value {:?} should enable filtering",
                 value
             );
@@ -611,7 +638,7 @@ mod tests {
         let mut config = crate::config::ConfigMap::new();
         config.insert("identitiesonly".into(), "yes".into());
 
-        let allowed = allowed_agent_key_blobs(&config);
+        let allowed = allowed_agent_key_blobs(&config, &[]);
         assert!(allowed.is_some());
         assert!(allowed.unwrap().is_empty());
     }
@@ -621,9 +648,9 @@ mod tests {
         // IdentitiesOnly=yes with IdentityFile pointing to nonexistent paths
         let mut config = crate::config::ConfigMap::new();
         config.insert("identitiesonly".into(), "yes".into());
-        config.insert("identityfile".into(), "/nonexistent/id_key".into());
+        let entries = entries_from(&["/nonexistent/id_key"]);
 
-        let allowed = allowed_agent_key_blobs(&config);
+        let allowed = allowed_agent_key_blobs(&config, &entries);
         assert!(allowed.is_some());
         assert!(allowed.unwrap().is_empty());
     }
