@@ -13,6 +13,7 @@ mod sessioninner;
 mod sessionwrap;
 mod sftp;
 mod sftpwrap;
+mod tokenizer;
 
 pub use auth::*;
 pub use config::*;
