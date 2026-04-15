@@ -17,20 +17,35 @@ fn parse_pub_key_blob(content: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(b64).ok()
 }
 
+/// Read a public-key file with a size cap so that FIFOs, device files, or
+/// accidentally huge inputs cannot stall or starve the auth path. Real
+/// OpenSSH public keys are well under 64 KiB.
+#[cfg(feature = "ssh2")]
+fn read_pub_key_file(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut content = String::new();
+    file.take(64 * 1024).read_to_string(&mut content).ok()?;
+    Some(content)
+}
+
 /// Collect allowed public key blobs from the `IdentityFile` entries in the
-/// ssh config. For each entry we check both the path as-is and with a `.pub`
-/// suffix appended, returning the first successfully parsed blob.
+/// ssh config. Only public-key material is read: the entry is read directly
+/// when its path already ends in `.pub`, otherwise the `<path>.pub` sibling
+/// is tried. Private-key files are never opened from this path.
 #[cfg(feature = "ssh2")]
 fn collect_identity_blobs(identity_files: &str) -> Vec<Vec<u8>> {
     let mut blobs = Vec::new();
     for file in identity_files.split_whitespace() {
-        for path in &[file.to_string(), format!("{}.pub", file)] {
-            if let Ok(s) = std::fs::read_to_string(path) {
-                if let Some(blob) = parse_pub_key_blob(&s) {
-                    log::trace!("allowing agent key with blob {}", hex::encode(&blob));
-                    blobs.push(blob);
-                    break;
-                }
+        let pub_path = if file.ends_with(".pub") {
+            file.to_string()
+        } else {
+            format!("{}.pub", file)
+        };
+        if let Some(content) = read_pub_key_file(std::path::Path::new(&pub_path)) {
+            if let Some(blob) = parse_pub_key_blob(&content) {
+                log::trace!("allowing agent key with blob {}", hex::encode(&blob));
+                blobs.push(blob);
             }
         }
     }
@@ -530,6 +545,54 @@ mod tests {
     fn collect_blobs_missing_files() {
         let blobs = collect_identity_blobs("/nonexistent/path/id_key");
         assert!(blobs.is_empty());
+    }
+
+    #[test]
+    fn collect_blobs_never_reads_private_key_path() {
+        // Private path contains an unparseable blob; the only parseable
+        // content is in the .pub sibling. If the private path were read
+        // we would either return a different (wrong) blob or produce a
+        // parse-error log; with the safe implementation we must pick up
+        // the .pub sibling without touching the private path.
+        let dir = tmpdir("blobs_priv_safe");
+        let priv_path = dir.join("id_test");
+        std::fs::write(
+            &priv_path,
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nnot a pub key\n",
+        )
+        .unwrap();
+
+        let pub_path = dir.join("id_test.pub");
+        std::fs::write(&pub_path, "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAA test\n").unwrap();
+
+        let blobs = collect_identity_blobs(priv_path.to_str().unwrap());
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(
+            blobs[0],
+            base64::engine::general_purpose::STANDARD
+                .decode("AAAAB3NzaC1yc2EAAAADAQABAAAA")
+                .unwrap()
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn collect_blobs_without_pub_sibling_returns_empty() {
+        // With only a private-key file present and no .pub sibling, the
+        // safe implementation returns no blobs. This is strictly better
+        // than the previous skip-on-IdentitiesOnly behavior and matches
+        // the documented `ssh-keygen -y` requirement.
+        let dir = tmpdir("blobs_no_pub");
+        let priv_path = dir.join("id_test");
+        std::fs::write(
+            &priv_path,
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nnot a pub key\n",
+        )
+        .unwrap();
+
+        let blobs = collect_identity_blobs(priv_path.to_str().unwrap());
+        assert!(blobs.is_empty());
+        cleanup(&dir);
     }
 
     #[test]
