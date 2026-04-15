@@ -59,12 +59,14 @@ All other options are parsed but have no effect.  Notably, neither `Match` or
 
 `ProxyUseFDpass` is now supported. (But not on Microsoft Windows).
 
-`IdentitiesOnly` is now correctly supported in the ssh2 backend when using agent authentication.
-When `IdentitiesOnly=yes` is set in your ssh config, wezterm will filter the
-keys offered by the SSH agent to only those whose public key matches a
-configured `IdentityFile` entry (checking both the private key file and the
-corresponding `.pub` file).  Previously, `IdentitiesOnly=yes` caused agent
-authentication to be skipped entirely. This also solves using YubiKeys, GPG, etc.
+`IdentitiesOnly` is now correctly supported in the ssh2 backend when using
+agent authentication. When `IdentitiesOnly=yes` is set in your ssh config,
+wezterm filters the keys offered by the SSH agent to those whose public-key
+blob matches a configured `IdentityFile` entry, checking the `<path>.pub`
+sibling (or the entry itself if it already ends in `.pub`). This enables
+agent-backed hardware keys (YubiKey, FIDO/SK, GPG smartcard) to work under
+`IdentitiesOnly=yes`, matching OpenSSH behavior. Previously,
+`IdentitiesOnly=yes` caused agent authentication to be skipped entirely.
 
 !!! note
     wezterm does not derive public keys automatically. If your `IdentityFile`
