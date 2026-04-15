@@ -1,6 +1,7 @@
 use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator};
 use crate::selection::SelectionRange;
 use crate::termwindow::box_model::*;
+use crate::termwindow::cursortrail::{CursorTrailState, HighlightKind};
 use crate::termwindow::render::{
     same_hyperlink, CursorProperties, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     RenderScreenLineParams,
@@ -17,6 +18,7 @@ use ordered_float::NotNan;
 use std::time::Instant;
 use wezterm_dynamic::Value;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
+use termwiz::surface::CursorVisibility;
 use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
 
@@ -78,11 +80,10 @@ impl crate::TermWindow {
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
 
         let cursor = pos.pane.get_cursor_position();
+        let pane_id = pos.pane.pane_id();
         if pos.is_active {
             self.prev_cursor.update(&cursor);
         }
-
-        let pane_id = pos.pane.pane_id();
         let current_viewport = self.get_viewport(pane_id);
         let dims = pos.pane.get_dimensions();
 
@@ -335,6 +336,9 @@ impl crate::TermWindow {
                 window_is_transparent: bool,
                 layers: &'a mut TripleLayerQuadAllocator<'b>,
                 error: Option<anyhow::Error>,
+                /// When true the cursor is omitted from line rendering and drawn
+                /// separately as an animated overlay in `paint_animated_cursor`.
+                suppress_cursor: bool,
             }
 
             let left_pixel_x = padding_left
@@ -365,6 +369,14 @@ impl crate::TermWindow {
                 window_is_transparent,
                 layers,
                 error: None,
+                // For the active pane only: suppress the static cursor from line
+                // rendering so it is drawn separately by paint_animated_cursor.
+                // Inactive panes must keep their cursor in line rendering because
+                // paint_animated_cursor is not called for them.
+                suppress_cursor: pos.is_active
+                    && (config.cursor_smear
+                        || config.cursor_trail_style.is_some()
+                        || config.cursor_animation_length > 0.0),
             };
 
             impl<'a, 'b> LineRender<'a, 'b> {
@@ -423,6 +435,12 @@ impl crate::TermWindow {
 
                     let shape_hash = self.term_window.shape_hash_for_line(line);
 
+                    // When cursor animation is active, keep the cursor in the
+                    // cache key so the line caches and reuses its quads across
+                    // frames while the cursor sits still.  The animated overlay
+                    // drawn by paint_animated_cursor covers the static cursor rect.
+                    let cache_cursor = cursor;
+
                     let quad_key = LineQuadCacheKey {
                         pane_id: self.pane_id,
                         password_input,
@@ -432,7 +450,7 @@ impl crate::TermWindow {
                         quad_generation: self.term_window.quad_generation,
                         composing: composing.clone(),
                         selection: selrange.clone(),
-                        cursor,
+                        cursor: cache_cursor,
                         shape_hash,
                         top_pixel_y: NotNan::new(self.top_pixel_y).unwrap()
                             + (line_idx + self.pos.top) as f32
@@ -486,6 +504,19 @@ impl crate::TermWindow {
                         },
                     };
 
+                    // Sentinel cursor that won't match any visible row,
+                    // used to suppress static cursor drawing when animating.
+                    let suppress_sentinel;
+                    let render_cursor: &StableCursorPosition = if self.suppress_cursor {
+                        suppress_sentinel = StableCursorPosition {
+                            y: StableRowIndex::MIN,
+                            ..*self.cursor
+                        };
+                        &suppress_sentinel
+                    } else {
+                        self.cursor
+                    };
+
                     let render_result = self
                         .term_window
                         .render_screen_line(
@@ -497,7 +528,7 @@ impl crate::TermWindow {
                                 stable_line_idx: Some(stable_row),
                                 line: &line,
                                 selection: selrange.clone(),
-                                cursor: &self.cursor,
+                                cursor: render_cursor,
                                 palette: &self.palette,
                                 dims: &self.dims,
                                 config: &self.term_window.config,
@@ -568,6 +599,82 @@ impl crate::TermWindow {
             pos.pane.with_lines_mut(stable_range.clone(), &mut render);
             if let Some(error) = render.error.take() {
                 return Err(error).context("error while calling with_lines_mut");
+            }
+        }
+
+        if pos.is_active
+            && (config.cursor_smear
+                || config.cursor_trail_style.is_some()
+                || config.cursor_animation_length > 0.0)
+        {
+            let now = Instant::now();
+            let cursor_visible = cursor.visibility == CursorVisibility::Visible;
+
+            {
+                let cell_width = self.render_metrics.cell_size.width as f32;
+                let cell_height = self.render_metrics.cell_size.height as f32;
+                let mut trails = self.cursor_trail_states.borrow_mut();
+                let trail = trails.entry(pane_id).or_insert_with(CursorTrailState::new);
+                if cursor_visible {
+                    trail.update(
+                        &cursor,
+                        cell_width,
+                        cell_height,
+                        config.cursor_trail_min_distance,
+                        config.cursor_trail_style,
+                        config.cursor_vfx_particle_density,
+                        config.cursor_vfx_particle_lifetime,
+                        config.cursor_vfx_particle_speed,
+                        config.cursor_smear,
+                        config.cursor_animation_length,
+                        config.cursor_trail_size,
+                        config.default_cursor_style.effective_shape(cursor.shape),
+                        now,
+                    );
+                } else {
+                    // Cursor hidden (e.g. paru, btop output phase): skip all
+                    // animation work so no trail or smear is painted. Position
+                    // is tracked silently so no jump-smear fires on reappear.
+                    trail.advance_hidden(&cursor);
+                }
+            }
+
+            if cursor_visible {
+                let trail_states = self.cursor_trail_states.borrow();
+                let trail_state = match trail_states.get(&pane_id) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+
+                if config.cursor_trail_style.is_some() {
+                    self.paint_cursor_trail(
+                        layers,
+                        pos,
+                        &cursor,
+                        &dims,
+                        current_viewport,
+                        top_pixel_y,
+                        padding_left,
+                        border.clone(),
+                        &palette,
+                        trail_state,
+                        now,
+                    )?;
+                }
+
+                self.paint_animated_cursor(
+                    layers,
+                    pos,
+                    &cursor,
+                    &dims,
+                    current_viewport,
+                    top_pixel_y,
+                    padding_left,
+                    border,
+                    &palette,
+                    trail_state,
+                    now,
+                )?;
             }
         }
 
@@ -685,5 +792,422 @@ impl crate::TermWindow {
             baseline: 1.0,
             content: ComputedElementContent::Children(vec![]),
         })
+    }
+
+    fn paint_cursor_trail(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        pos: &PositionedPane,
+        cursor: &StableCursorPosition,
+        dims: &RenderableDimensions,
+        current_viewport: Option<StableRowIndex>,
+        top_pixel_y: f32,
+        padding_left: f32,
+        border: window::parameters::Border,
+        palette: &ColorPalette,
+        trail_state: &CursorTrailState,
+        now: Instant,
+    ) -> anyhow::Result<()> {
+        let config = &self.config;
+
+        if !trail_state.has_active_animation() {
+            return Ok(());
+        }
+
+        let cell_width = self.render_metrics.cell_size.width as f32;
+        let cell_height = self.render_metrics.cell_size.height as f32;
+
+        let viewport_top: StableRowIndex = current_viewport.unwrap_or(dims.physical_top);
+        let viewport_top_px = viewport_top as f32 * cell_height;
+        let viewport_h_px = dims.viewport_rows as f32 * cell_height;
+
+        let pane_left = pos.left as f32 * cell_width;
+        let pane_top = pos.top as f32 * cell_height;
+        let left_offset = padding_left + border.left.get() as f32;
+
+        let cursor_shape = config.default_cursor_style.effective_shape(cursor.shape);
+        let trail_color = if config.force_reverse_video_cursor {
+            palette.foreground.to_linear()
+        } else {
+            palette.cursor_bg.to_linear()
+        };
+        let (r, g, b, _) = trail_color.tuple();
+        let start_opacity = config.cursor_vfx_opacity;
+
+        let layer_num = match cursor_shape {
+            termwiz::surface::CursorShape::BlinkingBar
+            | termwiz::surface::CursorShape::SteadyBar => 2,
+            _ => 0,
+        };
+
+        // ── Particles (Railgun / Torpedo / PixieDust) ─────────────────────────
+        // Batch all visible particle quads into a single vertex buffer submission
+        // to avoid per-particle allocate() overhead (up to 256 draw calls → 1).
+        {
+            use crate::quad::{TripleLayerQuadAllocatorTrait, Vertex, VERTICES_PER_CELL};
+
+            let half_win_w = self.dimensions.pixel_width as f32 / 2.0;
+            let half_win_h = self.dimensions.pixel_height as f32 / 2.0;
+            let particle_size = config.cursor_vfx_particle_size;
+
+            let (has_color, mix_val, is_ring) = match config.cursor_trail_style {
+                Some(config::CursorTrailStyle::Railgun)
+                | Some(config::CursorTrailStyle::Torpedo) => (5.0f32, 0.5f32, true),
+                _ => (3.0f32, 0.0f32, false),
+            };
+
+            let gl_state = self.render_state.as_ref();
+            let (tx1, tx2, ty1, ty2) = if is_ring {
+                (0.0f32, 1.0f32, 0.0f32, 1.0f32)
+            } else if let Some(gs) = gl_state {
+                let tex = gs.util_sprites.filled_box.texture_coords();
+                (tex.min_x(), tex.max_x(), tex.min_y(), tex.max_y())
+            } else {
+                (0.0, 1.0, 0.0, 1.0)
+            };
+
+            let mut batch: Vec<Vertex> =
+                Vec::with_capacity(trail_state.particles.len() * VERTICES_PER_CELL);
+
+            for p in &trail_state.particles {
+                let life_frac = p.lifetime / p.max_lifetime;
+                let alpha = start_opacity * life_frac;
+                if alpha <= 0.005 {
+                    continue;
+                }
+
+                let screen_x = left_offset + pane_left + p.x;
+                let screen_y = top_pixel_y + pane_top + (p.y - viewport_top_px);
+
+                if screen_y < top_pixel_y + pane_top - cell_height
+                    || screen_y > top_pixel_y + pane_top + viewport_h_px
+                {
+                    continue;
+                }
+
+                let col = [r, g, b, alpha];
+                let hsv = [1.0f32, 1.0, 1.0];
+
+                let size = match config.cursor_trail_style {
+                    Some(config::CursorTrailStyle::PixieDust) => cell_width * particle_size * 0.4,
+                    _ => cell_width * particle_size * life_frac,
+                };
+                let half = size * 0.5;
+
+                let mk = |px: f32, py: f32, u: f32, v: f32| Vertex {
+                    position: [px, py],
+                    tex: [u, v],
+                    fg_color: col,
+                    alt_color: col,
+                    hsv,
+                    has_color,
+                    mix_value: mix_val,
+                };
+
+                batch.push(mk(
+                    screen_x - half - half_win_w,
+                    screen_y - half - half_win_h,
+                    tx1,
+                    ty1,
+                ));
+                batch.push(mk(
+                    screen_x + half - half_win_w,
+                    screen_y - half - half_win_h,
+                    tx2,
+                    ty1,
+                ));
+                batch.push(mk(
+                    screen_x - half - half_win_w,
+                    screen_y + half - half_win_h,
+                    tx1,
+                    ty2,
+                ));
+                batch.push(mk(
+                    screen_x + half - half_win_w,
+                    screen_y + half - half_win_h,
+                    tx2,
+                    ty2,
+                ));
+            }
+
+            if !batch.is_empty() {
+                layers.extend_with(layer_num, &batch);
+            }
+        }
+
+        // ── Highlight (SonicBoom / Ripple / Wireframe) ───────────────────────
+        if let Some(ref h) = trail_state.highlight {
+            match &h.kind {
+                // ── SonicBoom: expanding filled square ────────────────────────
+                HighlightKind::SonicBoom { cx, cy } => {
+                    let t = h.t;
+                    let opacity = start_opacity * (1.0 - t).powi(2);
+                    if opacity > 0.005 {
+                        let radius = t * cell_height * 1.5;
+                        let d = radius * 2.0;
+                        let screen_cx = left_offset + pane_left + cx;
+                        let screen_cy = top_pixel_y + pane_top + (cy - viewport_top_px);
+                        self.filled_rectangle(
+                            layers,
+                            layer_num,
+                            euclid::rect(screen_cx - radius, screen_cy - radius, d, d),
+                            LinearRgba::with_components(r, g, b, opacity),
+                        )?;
+                    }
+                }
+
+                // ── Ripple: expanding hollow ring (4 thin rectangles) ─────────
+                HighlightKind::Ripple { cx, cy } => {
+                    let t = h.t;
+                    let opacity = start_opacity * (1.0 - t);
+                    if opacity > 0.005 {
+                        let radius = t * cell_height * 2.5;
+                        let bw = 2.5_f32;
+                        let d = radius * 2.0;
+                        let screen_cx = left_offset + pane_left + cx;
+                        let screen_cy = top_pixel_y + pane_top + (cy - viewport_top_px);
+                        let x0 = screen_cx - radius;
+                        let y0 = screen_cy - radius;
+                        let color = LinearRgba::with_components(r, g, b, opacity);
+                        // top bar
+                        self.filled_rectangle(
+                            layers,
+                            layer_num,
+                            euclid::rect(x0, y0, d, bw),
+                            color,
+                        )?;
+                        // bottom bar
+                        self.filled_rectangle(
+                            layers,
+                            layer_num,
+                            euclid::rect(x0, y0 + d - bw, d, bw),
+                            color,
+                        )?;
+                        // left side
+                        self.filled_rectangle(
+                            layers,
+                            layer_num,
+                            euclid::rect(x0, y0 + bw, bw, d - 2.0 * bw),
+                            color,
+                        )?;
+                        // right side
+                        self.filled_rectangle(
+                            layers,
+                            layer_num,
+                            euclid::rect(x0 + d - bw, y0 + bw, bw, d - 2.0 * bw),
+                            color,
+                        )?;
+                    }
+                }
+
+                // ── Wireframe: expanding hollow rectangle (cell aspect ratio) ─
+                HighlightKind::Wireframe {
+                    cx,
+                    cy,
+                    cell_w,
+                    cell_h,
+                } => {
+                    let t = h.t;
+                    let opacity = start_opacity * (1.0 - t);
+                    if opacity > 0.005 {
+                        let scale = t * 2.5;
+                        let rx = cell_w * scale;
+                        let ry = cell_h * scale;
+                        let bw = 2.5_f32;
+                        let w = rx * 2.0;
+                        let h = ry * 2.0;
+                        let screen_cx = left_offset + pane_left + cx;
+                        let screen_cy = top_pixel_y + pane_top + (cy - viewport_top_px);
+                        let x0 = screen_cx - rx;
+                        let y0 = screen_cy - ry;
+                        let color = LinearRgba::with_components(r, g, b, opacity);
+                        // top bar
+                        self.filled_rectangle(
+                            layers,
+                            layer_num,
+                            euclid::rect(x0, y0, w, bw),
+                            color,
+                        )?;
+                        // bottom bar
+                        self.filled_rectangle(
+                            layers,
+                            layer_num,
+                            euclid::rect(x0, y0 + h - bw, w, bw),
+                            color,
+                        )?;
+                        // left side
+                        self.filled_rectangle(
+                            layers,
+                            layer_num,
+                            euclid::rect(x0, y0 + bw, bw, h - 2.0 * bw),
+                            color,
+                        )?;
+                        // right side
+                        self.filled_rectangle(
+                            layers,
+                            layer_num,
+                            euclid::rect(x0 + w - bw, y0 + bw, bw, h - 2.0 * bw),
+                            color,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // Schedule the next repaint immediately; the presentation engine
+        // (PresentMode::Fifo) will vsync to the actual display refresh rate.
+        if trail_state.has_active_animation() {
+            self.update_next_frame_time(Some(now));
+        }
+
+        Ok(())
+    }
+
+    /// Draws the cursor at its target position, rendering the Neovide-style
+    /// deforming smear body when `cursor_smear` is active.
+    fn paint_animated_cursor(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        pos: &PositionedPane,
+        cursor: &StableCursorPosition,
+        dims: &RenderableDimensions,
+        current_viewport: Option<StableRowIndex>,
+        top_pixel_y: f32,
+        padding_left: f32,
+        border: window::parameters::Border,
+        palette: &ColorPalette,
+        trail_state: &CursorTrailState,
+        now: Instant,
+    ) -> anyhow::Result<()> {
+        let config = &self.config;
+
+        let cell_width = self.render_metrics.cell_size.width as f32;
+        let cell_height = self.render_metrics.cell_size.height as f32;
+
+        let viewport_top_px = current_viewport.unwrap_or(dims.physical_top) as f32 * cell_height;
+        let pane_left = pos.left as f32 * cell_width;
+        let pane_top = pos.top as f32 * cell_height;
+        let left_offset = padding_left + border.left.get() as f32;
+
+        let cursor_color = if config.force_reverse_video_cursor {
+            palette.foreground.to_linear()
+        } else {
+            palette.cursor_bg.to_linear()
+        };
+
+        let shape = config.default_cursor_style.effective_shape(cursor.shape);
+
+        // Apply cursor blink if the shape is a blinking variant.
+        let is_blinking = matches!(
+            shape,
+            termwiz::surface::CursorShape::BlinkingBlock
+                | termwiz::surface::CursorShape::BlinkingBar
+                | termwiz::surface::CursorShape::BlinkingUnderline
+        ) && config.cursor_blink_rate != 0
+            && self.focused.is_some()
+            && pos.is_active;
+
+        let cursor_color = if is_blinking {
+            let mut color_ease = self.cursor_blink_state.borrow_mut();
+            color_ease.update_start(self.prev_cursor.last_cursor_movement());
+            let (intensity, next) = color_ease.intensity_continuous();
+            self.update_next_frame_time(Some(next));
+            // intensity=0 → fully visible, intensity=1 → fully invisible.
+            // Skip drawing entirely when invisible so the cursor truly disappears
+            // (drawing a zero-alpha rect on a solid background shows nothing, but
+            // smear / trail draws underneath it would still be visible otherwise).
+            if intensity >= 1.0 {
+                return Ok(());
+            }
+            let (r, g, b, _a) = cursor_color.tuple();
+            LinearRgba::with_components(r, g, b, 1.0 - intensity)
+        } else {
+            cursor_color
+        };
+
+        // Logical (target) cursor position in stable pixel space.
+        let target_x = cursor.x as f32 * cell_width;
+        let target_y = cursor.y as f32 * cell_height;
+
+        // Screen offset shared by both visual and target positions.
+        let screen_off_x = left_offset + pane_left;
+        let screen_off_y = top_pixel_y + pane_top - viewport_top_px;
+
+        // Per-shape: cursor rect size, cell-relative TL offset, render layer.
+        let (rect_w, rect_h, off_x, off_y, layer) = match shape {
+            termwiz::surface::CursorShape::Default
+            | termwiz::surface::CursorShape::BlinkingBlock
+            | termwiz::surface::CursorShape::SteadyBlock => {
+                (cell_width, cell_height, 0.0f32, 0.0f32, 0usize)
+            }
+            termwiz::surface::CursorShape::BlinkingUnderline
+            | termwiz::surface::CursorShape::SteadyUnderline => {
+                let h = (cell_height * 0.1).max(2.0);
+                (cell_width, h, 0.0, cell_height - h, 0)
+            }
+            termwiz::surface::CursorShape::BlinkingBar
+            | termwiz::surface::CursorShape::SteadyBar => {
+                let w = (cell_width * 0.15).max(2.0);
+                (w, cell_height, 0.0, 0.0, 2)
+            }
+        };
+
+        // ── Neovide-style deforming smear (all shapes) ───────────────────────
+        // Four corners animate at different speeds — leading edge races ahead,
+        // trailing edge lags — producing the characteristic stretched-body look.
+        // Corner targets are shape-adjusted (bar compressed, underline at bottom)
+        // in the trail state so the animated positions are already correct.
+        let smear_active = config.cursor_smear
+            && trail_state.has_smear_animation(target_x, target_y, cell_width, cell_height);
+
+        if smear_active {
+            let c = &trail_state.smear_corners;
+            let tl = (screen_off_x + c[0].visual_x, screen_off_y + c[0].visual_y);
+            let tr = (screen_off_x + c[1].visual_x, screen_off_y + c[1].visual_y);
+            let br = (screen_off_x + c[2].visual_x, screen_off_y + c[2].visual_y);
+            let bl = (screen_off_x + c[3].visual_x, screen_off_y + c[3].visual_y);
+
+            let corner_alphas = if config.cursor_smear_gradient {
+                let (_, _, _, base_a) = cursor_color.tuple();
+                let offsets = trail_state.corner_offsets();
+                let max_dist = cell_width.hypot(cell_height);
+                Some(std::array::from_fn::<f32, 4, _>(|i| {
+                    let (ox, oy) = offsets[i];
+                    let tx = target_x + ox * cell_width;
+                    let ty = target_y + oy * cell_height;
+                    let dist = (c[i].visual_x - tx).hypot(c[i].visual_y - ty);
+                    let lag = (dist / max_dist).min(1.0);
+                    base_a * (1.0 - lag)
+                }))
+            } else {
+                None
+            };
+
+            self.draw_cursor_deformed_quad(layers, 0, tl, tr, br, bl, cursor_color, corner_alphas);
+            self.update_next_frame_time(Some(now));
+        }
+
+        // Draw the cursor rect at the target position with the actual cursor
+        // shape. When animating this caps the smear's deformed front face,
+        // making the cursor head appear straight and undistorted. When at rest
+        // (no smear) this is the sole cursor draw.
+        //
+        // Suppressed while a multi-cell jump is being deferred for snap-back
+        // detection: drawing it would betray the deferred destination, since
+        // the smear quad is still frozen at the pre-jump cell. The smear quad
+        // alone is enough — at rest it forms a regular cursor block at the
+        // pre-jump cell, which is exactly what we want the user to see.
+        if !trail_state.is_smear_deferred() {
+            let screen_x = screen_off_x + target_x + off_x;
+            let screen_y = screen_off_y + target_y + off_y;
+            self.filled_rectangle(
+                layers,
+                layer,
+                euclid::rect(screen_x, screen_y, rect_w, rect_h),
+                cursor_color,
+            )?;
+        }
+
+        Ok(())
     }
 }
